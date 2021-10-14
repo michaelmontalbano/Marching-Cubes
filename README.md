@@ -7,7 +7,6 @@ our method was to use statistical information about the graphs as input
 to our neural networks.
 
 Volumizer.py - main file, does data augmentation and builds dataset. 
-Other files 
+predict.py - Prediction algorithms, from scratch 
 
-This was my first data science project. It's very cool, but there are some deficiencies 
-in the implementation.
+
