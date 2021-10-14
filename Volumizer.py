@@ -1,3 +1,9 @@
+# Michael Montalbano 10/14/2021
+# Find and create volumetric structures (graphs) within 3D numpy arrays
+# numerous fields are used, and each structure must meet the thresholds 
+# for each field for a given feature
+# i.e. a zdrColumn is a connected graph with all grid points exceeding the thresholds for dBZ and zdr
+
 from netCDF4 import Dataset
 import pandas as pd
 import numpy as np
@@ -26,7 +32,6 @@ dates = ["20120329"]
 
 clr_dict = {features_list[i]: colors[i] for i in range(len(features_list))}
 
-
 np.set_printoptions(threshold=sys.maxsize)
 
 SHAVE_path = "/mnt/data/SHAVE_cases/"
@@ -34,7 +39,7 @@ SHAVE_path = "/mnt/data/SHAVE_cases/"
 casesPath = "/mnt/data/SHAVE_cubes/"
 shavePath = "/mnt/data/SHAVE_cases/"
 
-
+# TEST CASE FOR TROUBLELSHOOTING
 date = "20130515"
 time1 = "23"
 time2 = "221000"
@@ -49,12 +54,14 @@ tracking = 1
 features = np.arange(0,12,1) # run for all features
 
 # field to feed into marching_cubes in case of exception
+# i.e. if V = 0 or null, make it equal to a minimum volume that we filter out on the backend
 A = np.zeros((3,3,3))
 for i in np.arange(0,1):
     for j in np.arange(0,1):
         for k in np.arange(0,1):
             A[i,j,k] = 1
  
+# initializing dataframe
 def buildDataFrame(features):
     titles = []
     titles.append("time")
@@ -90,6 +97,8 @@ def buildDataFrame(features):
     df = pd.DataFrame(columns=titles)
     return df
 
+# choose feature, rudimentary system that I used, could be improved or altered using either
+# OOP or just a function. 
 def setFeature(chosen):
     global chosenFields, chosenThresholds, chosenHeights, interest, feat
     if chosen == 0:
@@ -193,9 +202,7 @@ def setFeature(chosen):
 
     return [chosenFields, chosenThresholds, chosenHeights, topHeights, interest, feat]
 
-def getHgtWghtedVolume():
-    '''
-    '''
+
 
 def getFields(timeStep,caseDate,fields3D, feature):
     '''
@@ -236,7 +243,11 @@ def getFields(timeStep,caseDate,fields3D, feature):
         fields.append(var)
     return fields
 
+
 def getHeights(timeStep, caseDate, fields3D, temp):
+    # unused function
+    # purpose is to retrieve heights,
+    # unsure 
     caseDate = "{:04d}{:02d}{:02d}".format(caseDate.year,caseDate.month,caseDate.day)
     currDate = "{:04d}{:02d}{:02d}".format(timeStep.year,timeStep.month,timeStep.day)
     hour = "{:02d}".format(timeStep.hour)
@@ -299,15 +310,15 @@ def mask(fields, heights, thresholds, zone):
        
     return masks
 
-def getNew()
-    mask both
 
 def getGrid(timeStep, caseDate, var):
+    # establish the grid for the case
     caseDate = "{:04d}{:02d}{:02d}".format(caseDate.year,caseDate.month,caseDate.day)
     currDate = "{:04d}{:02d}{:02d}".format(timeStep.year,timeStep.month,timeStep.day)
     hour = "{:02d}".format(timeStep.hour)
     dateTime = "{:04d}{:02d}{:02d}-{:02d}{:02d}{:02d}".format(timeStep.year,timeStep.month,timeStep.day,timeStep.hour,timeStep.minute,timeStep.second)
 
+    # file contains grid info
     file = casesPath+caseDate+"\\finished0"
     words = []
     try:
@@ -334,6 +345,7 @@ def getGrid(timeStep, caseDate, var):
             latLon[i,j,1] = lonNW + spacing*j
     return latLon
 
+# functions for grabbing statistical information about the objects
 def getMax(subgraphs, field):
     '''
     input: either the graph or the mesh
@@ -440,6 +452,9 @@ def filterForHeight(fields,masks,height):
     return masks
 
 def createMesh(graphs, feature):
+    # Marching cubes outputs a set of graphs,
+    # createMesh takes those graphs and the feature, and makes a mesh
+    # which is useful for visualization
     mesh_container = []
     object_container = []
     nets = []
@@ -487,6 +502,7 @@ def createMesh(graphs, feature):
     # subgraphs[0] contains the verts and faces of the first connected graph
 
 def createGraphs(fields):
+    # Use marching cubes to find graphs
     nets = []
     graphs = []
     for field in fields:
@@ -519,6 +535,7 @@ def getVolume(nets, subgraphs):
     return volumes
 
 def track(subgraphs, latLon, currTime, caseDate):
+    # access file for storm location
     df = pd.read_csv(casesPath + "/" + caseDate + "/features.csv")
     time = df["EpochTime"]
     for idx, item in enumerate(time):
@@ -612,6 +629,10 @@ def update_timestep(time, feature):
 
 
 def getData(caseDate):
+    # Main function
+    # Loops through the cases, 
+    # compiles a database of 
+    # statistical information about each training sample
     daymonthyear = caseDate[:8] 
     caseDate = datetime.strptime(caseDate,DATE_FORMAT)
     done = 0
