@@ -8,17 +8,13 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import GridSearchCV
 import sys
 from pprint import pprint
-
-
-# PLAN
-
-# show model predicted size vs observed size
-# mean absolute error
-# bullet point about how well it performed
-# human generated manual interrogated 
-# merge with something more subjective that relies on the knowledge of a forecaster
-
-
+matplotlib.use('agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.ensemble import (GradientBoostingClassifier,
+                              GradientBoostingRegressor)
+from sklearn.metrics import log_loss, mean_absolute_error
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, train_test_split, GridSearchCV
 
 
 df = pd.read_csv('C:\\Users\\User\\weather\\alldata.csv')
@@ -37,20 +33,20 @@ for col in df.columns:
     if col[-8:] == 'centroid':
         df = df.drop(columns=[col])
 
-#clean_df = df[['maxEst','zdrColumn_numVol','zdrColumn_totalVolume','zdrColumn_MergedDZDR_max','zdrColumn_depth','zdrColumn_width','zdrColumn_specificVolume',
-#        'zdrColumn_MergedDZDR_corr','zdrColumn_MergedReflectivityQC_corr','zdrColumn_MergedDRHO_corr']]
+clean_df = df[['maxEst','zdrColumn_numVol','zdrColumn_totalVolume','zdrColumn_MergedDZDR_max','zdrColumn_depth','zdrColumn_width','zdrColumn_specificVolume',
+       'zdrColumn_MergedDZDR_corr','zdrColumn_MergedReflectivityQC_corr','zdrColumn_MergedDRHO_corr']]
 
-#clean_df = df[['maxEst','zdrColumn_totalVolume','zdrColumn_MergedDZDR_max','zdrColumn_specificVolume','zdrColumn_MergedReflectivityQC_corr','zdrColumn_MergedDZDR_corr','SWDI_VIL','SWDI_POSH','TBSS','WER']]
+clean_df = df[['maxEst','zdrColumn_totalVolume','zdrColumn_MergedDZDR_max','zdrColumn_specificVolume','zdrColumn_MergedReflectivityQC_corr','zdrColumn_MergedDZDR_corr','SWDI_VIL','SWDI_POSH','TBSS','WER']]
 
-#df = clean_df
-#clean_df[clean_df<0] = 0
-# def label_hail(column):
-#         if column[0] > 0.3:
-#             return 1
-#         if column[0] <= 0.3:
-#             return 0
+df = clean_df
+clean_df[clean_df<0] = 0
 
-# sets binary column 'hail' which is 1 if hail, 0 otherwise
+def label_hail(column):
+        if column[0] > 0.3:
+            return 1
+        if column[0] <= 0.3:
+            return 0
+#sets binary column 'hail' which is 1 if hail, 0 otherwise
 
 def rescale(df):
     rescale_df = df
@@ -83,36 +79,18 @@ def split_data(df, prob):
 # dataset = train.drop(columns={'maxEst'})
 
 
-import numpy as np
-import pandas as pd
-import matplotlib
-matplotlib.use('agg')
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.ensemble import (GradientBoostingClassifier,
-                              GradientBoostingRegressor)
-from sklearn.metrics import log_loss, mean_absolute_error
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, train_test_split, GridSearchCV
-​
-##GET DATA AND CLEAN IT UP
-#read in our data
-#data = pd.read_csv('TheClusters_SHAVE_Soundings.csv', sep=",")
+
+# CODE FOR POSTER PREDICTION, i.e. not from scratch
 data = df
 data = data.replace([-99900., -99903], 0.) # replace any WDSS-II missing values with 0
-targets = data["maxEst"] #these are the data we are going to try to predict
-#drop the RowName column, it's not helpful nor really data and also drop our targets out of the data
-
+targets = data["maxEst"] # y_true 
 
 #need to make our targets a class
 #this is needed for both the classifier and for splitting the data so we have representative samples (See below)
 targets['maxEst'] = pd.cut(targets["maxEst"], bins=[-1,0.254,25.3,50.7,200.],include_lowest=True,right=False,labels=[0,1,2,3])
-#targets['Common_Class'] = pd.cut(targets["SHAVE_Common"], bins=[-1,0.254,25.3,50.7,200.],include_lowest=True,right=False,labels=[0,1,2,3])
 ​
 #split the data into the train/validate and test sets
 data_train, data_test, target_train, target_test = train_test_split(data, targets['maxEst'], test_size = 0.2, random_state=42)
-​
-#### EDIT ABOVE HERE FOR YOUR DATA
-#### EDIT BELOW HERE FOR MODEL SET UP
 ​
 #choose which model architecture to use
 gbr = GradientBoostingRegressor(max_features='sqrt') 
@@ -145,85 +123,7 @@ pd.DataFrame(predictions).to_csv("Predictions_Max.csv")
 pd.DataFrame(target_test).to_csv("Targets_Max.csv")
 
 
-
-
-
-
-
-# import numpy as np
-# import pandas as pd
-# import matplotlib
-# matplotlib.use('agg')
-# import matplotlib.pyplot as plt
-# import seaborn as sns
-# from sklearn.ensemble import (GradientBoostingClassifier,
-#                               GradientBoostingRegressor)
-# from sklearn.metrics import log_loss, mean_absolute_error
-# from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, train_test_split, GridSearchCV
-# ​
-# ##GET DATA AND CLEAN IT UP
-# #read in our data
-# data = pd.read_csv('TheClusters_SHAVE_Soundings.csv', sep=",")
-# data = data.replace([-99900., -99903], 0.) # replace any WDSS-II missing values with 0
-# targets = data[["SHAVE_Common", "SHAVE_Max"]] #these are the data we are going to try to predict
-# #drop the RowName column, it's not helpful nor really data and also drop our targets out of the data
-# data = data.drop(columns=["RowName", "SHAVE_Common", "SHAVE_Max"])
-# #need to make our targets a class
-# #this is needed for both the classifier and for splitting the data so we have representative samples (See below)
-# targets['Max_Class'] = pd.cut(targets["SHAVE_Max"], bins=[-1,0.254,25.3,50.7,200.],include_lowest=True,right=False,labels=[0,1,2,3])
-# targets['Common_Class'] = pd.cut(targets["SHAVE_Common"], bins=[-1,0.254,25.3,50.7,200.],include_lowest=True,right=False,labels=[0,1,2,3])
-# ​
-# #split the data into the train/validate and test sets
-# data_train, data_test, target_train, target_test = train_test_split(x_train, y_train, test_size = 0.2, random_state=42)
-# ​
-# #### EDIT ABOVE HERE FOR YOUR DATA
-# #### EDIT BELOW HERE FOR MODEL SET UP
-# ​
-# #choose which model architecture to use
-# gbr = GradientBoostingRegressor(max_features='sqrt') 
-# ​
-# #hyperparamter grid for searching
-# param_grid = [{'n_estimators': [100, 200, 300, 400, 500], 'max_depth': [5, 10, 15]}]
-# ​
-# #set up the train/validate cross-validation
-# grid_search = GridSearchCV(gbr, param_grid, cv=10, scoring='neg_mean_absolute_error', n_jobs=10) #make the CV object
-# results = grid_search.fit(data_train, target_train) #do the CV
-# ​
-# #save the results for plotting
-# results_dataframe = pd.DataFrame.from_dict(grid_search.cv_results_)
-# results_dataframe.to_csv("Results_Max.csv") 
-# ​
-# #get the best hyperparameters
-# bestparams = grid_search.best_estimator_
-# #run the best model on the test data
-# predictions = bestparams.predict(data_test) 
-# ​
-# #calculate the MAE for the test set
-# calcmae = mean_absolute_error(target_test, predictions) 
-# ​
-# #print the test set MAE
-# print(grid_search.best_params_)
-# print('Calculated MAE: target values/predicted values: ' + str(calcmae))
-# ​
-# #save the test set obs and test set predictions for plotting
-# pd.DataFrame(predictions).to_csv("Predictions_Max.csv")
-# pd.DataFrame(target_test).to_csv("Targets_Max.csv")
-
-# # metrics
-# def accuracy(y_true, y_pred):
-#     accuracy = np.sum(y_true == y_pred) / len(y_true)
-#     return accuracy
-
-# parameters = {'kernel':('linear', 'rbf')}
-
-
-# regr = RandomForestRegressor(max_depth=3, random_state = 0)
-# regr.fit(x_train, y_train)
-# y_pred = regr.predict(x_test)
-# print(regr.score(x_test,y_test))
-
-
-
+# Code for from-scratch predictions
 def distance(x, y):
     # returns euclidean distance
     dist = np.sqrt(np.sum(x-y)**2)
