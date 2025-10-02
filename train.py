@@ -132,8 +132,13 @@ class InputPipeline:
     def data_generator(self):
         """Generator for training data batches."""
         while True:
-            # Randomly sample batch
-            selected_rows = self.train_df.sample(self.batch_size)
+            # Randomly sample batch. When the dataset is smaller than the
+            # requested batch size we fall back to sampling with replacement so
+            # the produced batch still matches the expected shape. This is
+            # important when the global batch size is scaled for multi-GPU
+            # training.
+            replace = self.batch_size > len(self.train_df)
+            selected_rows = self.train_df.sample(self.batch_size, replace=replace)
             
             batch_inputs = []
             batch_labels = []
@@ -339,6 +344,21 @@ def main():
     # Initialize
     s3_client = boto3.client('s3')
     data_loader = DataLoader(BUCKET, s3_client)
+
+    # Create a distribution strategy so the script can make use of multiple
+    # GPUs when they are available. MirroredStrategy automatically detects all
+    # local GPUs; otherwise we fall back to the default (CPU/single GPU)
+    # strategy.
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        strategy = tf.distribute.MirroredStrategy()
+        print(f"Using MirroredStrategy with {strategy.num_replicas_in_sync} replica(s)")
+    else:
+        strategy = tf.distribute.get_strategy()
+        print("Using default TensorFlow strategy (no multi-GPU detected)")
+
+    global_batch_size = BATCH_SIZE * strategy.num_replicas_in_sync
+    print(f"Global batch size: {global_batch_size}")
     
     # Load normalization params
     print("Loading normalization parameters...")
@@ -354,30 +374,31 @@ def main():
     
     # Create datasets
     print("Creating datasets...")
-    train_pipeline = InputPipeline(BATCH_SIZE, data_loader, train_df)
-    val_pipeline = InputPipeline(BATCH_SIZE, data_loader, val_df)
+    train_pipeline = InputPipeline(global_batch_size, data_loader, train_df)
+    val_pipeline = InputPipeline(global_batch_size, data_loader, val_df)
     
     train_dataset = train_pipeline.create_dataset()
     val_dataset = val_pipeline.create_dataset()
     
     # Calculate steps
-    steps_per_epoch = len(train_df) // BATCH_SIZE
-    val_steps = len(val_df) // BATCH_SIZE
+    steps_per_epoch = max(1, len(train_df) // global_batch_size)
+    val_steps = max(1, len(val_df) // global_batch_size)
     
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Validation steps: {val_steps}")
     
     # Build and compile model
     print("Building model...")
-    trainer = ModelTrainer(
-        initial_filters=INITIAL_FILTERS,
-        kernel_size=KERNEL_SIZE,
-        num_downsampling=NUM_DOWNSAMPLING,
-        dropout_rate=DROPOUT_RATE
-    )
-    
-    trainer.build_model()
-    trainer.compile_model(LEARNING_RATE)
+    with strategy.scope():
+        trainer = ModelTrainer(
+            initial_filters=INITIAL_FILTERS,
+            kernel_size=KERNEL_SIZE,
+            num_downsampling=NUM_DOWNSAMPLING,
+            dropout_rate=DROPOUT_RATE
+        )
+
+        trainer.build_model()
+        trainer.compile_model(LEARNING_RATE)
     
     # Train
     print("Training...")

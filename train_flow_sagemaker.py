@@ -166,7 +166,8 @@ class FlowMatchingInputPipeline:
 
     def data_generator(self):
         while True:
-            selected_rows = self.df.sample(min(self.batch_size, len(self.df)))
+            replace = self.batch_size > len(self.df)
+            selected_rows = self.df.sample(self.batch_size, replace=replace)
 
             batch_conditions = []
             batch_targets = []
@@ -410,8 +411,12 @@ def main():
                 print(f"Configured GPU: {gpu}")
             except RuntimeError as exc:
                 print(f"GPU configuration error: {exc}")
+        strategy = tf.distribute.MirroredStrategy()
+        print(f"Using MirroredStrategy with {strategy.num_replicas_in_sync} replica(s)")
     else:
         print("No GPUs found, using CPU")
+        strategy = tf.distribute.get_strategy()
+        print("Using default TensorFlow strategy (no multi-GPU detected)")
 
     print("\nTraining Configuration:")
     for k, v in vars(args).items():
@@ -439,8 +444,11 @@ def main():
     print(f"Val samples: {len(val_df)}")
 
     print("Creating flow matching datasets...")
+    global_batch_size = args.batch_size * strategy.num_replicas_in_sync
+    print(f"Global batch size: {global_batch_size}")
+
     train_pipeline = FlowMatchingInputPipeline(
-        args.batch_size,
+        global_batch_size,
         data_loader,
         train_df,
         args.timesteps,
@@ -451,7 +459,7 @@ def main():
         norm_channels,
     )
     val_pipeline = FlowMatchingInputPipeline(
-        args.batch_size,
+        global_batch_size,
         data_loader,
         val_df,
         args.timesteps,
@@ -465,15 +473,16 @@ def main():
     train_dataset = train_pipeline.create_dataset()
     val_dataset = val_pipeline.create_dataset()
 
-    steps_per_epoch = max(1, len(train_df) // args.batch_size)
-    val_steps = max(1, len(val_df) // args.batch_size)
+    steps_per_epoch = max(1, len(train_df) // global_batch_size)
+    val_steps = max(1, len(val_df) // global_batch_size)
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Validation steps: {val_steps}")
 
     print("\nBuilding model...")
-    trainer = ModelTrainer(args)
-    trainer.build_model()
-    trainer.compile_model()
+    with strategy.scope():
+        trainer = ModelTrainer(args)
+        trainer.build_model()
+        trainer.compile_model()
 
     print("\nStarting training...")
     history = trainer.train(
@@ -495,3 +504,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

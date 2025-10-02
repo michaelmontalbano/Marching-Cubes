@@ -184,7 +184,8 @@ class InputPipeline:
         used to derive input/target keys.
         """
         while True:
-            selected_rows = self.df.sample(min(self.batch_size, len(self.df)))
+            replace = self.batch_size > len(self.df)
+            selected_rows = self.df.sample(self.batch_size, replace=replace)
 
             batch_inputs = []
             batch_labels = []
@@ -401,8 +402,12 @@ def main():
                 print(f"Configured GPU: {gpu}")
             except RuntimeError as e:
                 print(f"GPU configuration error: {e}")
+        strategy = tf.distribute.MirroredStrategy()
+        print(f"Using MirroredStrategy with {strategy.num_replicas_in_sync} replica(s)")
     else:
         print("No GPUs found, using CPU")
+        strategy = tf.distribute.get_strategy()
+        print("Using default TensorFlow strategy (no multi-GPU detected)")
 
     # Print configuration
     print("\nTraining Configuration:")
@@ -435,12 +440,15 @@ def main():
 
     # Create datasets
     print("Creating datasets...")
+    global_batch_size = args.batch_size * strategy.num_replicas_in_sync
+    print(f"Global batch size: {global_batch_size}")
+
     train_pipeline = InputPipeline(
-        args.batch_size, data_loader, train_df, args.timesteps,
+        global_batch_size, data_loader, train_df, args.timesteps,
         args.height, args.width, args.input_channels, args.output_channels, norm_channels
     )
     val_pipeline = InputPipeline(
-        args.batch_size, data_loader, val_df, args.timesteps,
+        global_batch_size, data_loader, val_df, args.timesteps,
         args.height, args.width, args.input_channels, args.output_channels, norm_channels
     )
 
@@ -448,16 +456,17 @@ def main():
     val_dataset = val_pipeline.create_dataset()
 
     # Steps
-    steps_per_epoch = max(1, len(train_df) // args.batch_size)
-    val_steps = max(1, len(val_df) // args.batch_size)
+    steps_per_epoch = max(1, len(train_df) // global_batch_size)
+    val_steps = max(1, len(val_df) // global_batch_size)
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Validation steps: {val_steps}")
 
     # Build / compile / train
     print("\nBuilding model...")
-    trainer = ModelTrainer(args)
-    trainer.build_model()
-    trainer.compile_model()
+    with strategy.scope():
+        trainer = ModelTrainer(args)
+        trainer.build_model()
+        trainer.compile_model()
 
     print("\nStarting training...")
     history = trainer.train(
@@ -480,3 +489,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
