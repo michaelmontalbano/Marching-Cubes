@@ -153,8 +153,11 @@ class FlowMatchingInputPipeline:
     def data_generator(self):
         """Generator for flow matching training data."""
         while True:
-            # Randomly sample batch
-            selected_rows = self.train_df.sample(self.batch_size)
+            # Randomly sample batch. Allow sampling with replacement when the
+            # requested batch size exceeds the dataset size (e.g. when the
+            # global batch size is scaled for multi-GPU training).
+            replace = self.batch_size > len(self.train_df)
+            selected_rows = self.train_df.sample(self.batch_size, replace=replace)
             
             batch_conditions = []  # Input context (all 12 timesteps)
             batch_targets = []     # Target MESH (single timestep)
@@ -400,33 +403,45 @@ def main():
     
     # Create datasets
     print("Creating flow matching datasets...")
-    train_pipeline = FlowMatchingInputPipeline(BATCH_SIZE, data_loader, train_df)
-    val_pipeline = FlowMatchingInputPipeline(BATCH_SIZE, data_loader, val_df)
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        strategy = tf.distribute.MirroredStrategy()
+        print(f"Using MirroredStrategy with {strategy.num_replicas_in_sync} replica(s)")
+    else:
+        strategy = tf.distribute.get_strategy()
+        print("Using default TensorFlow strategy (no multi-GPU detected)")
+
+    global_batch_size = BATCH_SIZE * strategy.num_replicas_in_sync
+    print(f"Global batch size: {global_batch_size}")
+
+    train_pipeline = FlowMatchingInputPipeline(global_batch_size, data_loader, train_df)
+    val_pipeline = FlowMatchingInputPipeline(global_batch_size, data_loader, val_df)
     
     train_dataset = train_pipeline.create_dataset()
     val_dataset = val_pipeline.create_dataset()
     
     # Calculate steps
-    steps_per_epoch = len(train_df) // BATCH_SIZE
-    val_steps = len(val_df) // BATCH_SIZE
+    steps_per_epoch = max(1, len(train_df) // global_batch_size)
+    val_steps = max(1, len(val_df) // global_batch_size)
     
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Validation steps: {val_steps}")
     
     # Build and compile model
     print("Building flow matching U-Net...")
-    trainer = ModelTrainer(
-        height=HEIGHT,
-        width=WIDTH,
-        input_channels=INPUT_CHANNELS,
-        timesteps=TIMESTEPS,
-        initial_filters=INITIAL_FILTERS,
-        num_downsampling=NUM_DOWNSAMPLING,
-        dropout_rate=DROPOUT_RATE
-    )
-    
-    trainer.build_model()
-    trainer.compile_model(LEARNING_RATE)
+    with strategy.scope():
+        trainer = ModelTrainer(
+            height=HEIGHT,
+            width=WIDTH,
+            input_channels=INPUT_CHANNELS,
+            timesteps=TIMESTEPS,
+            initial_filters=INITIAL_FILTERS,
+            num_downsampling=NUM_DOWNSAMPLING,
+            dropout_rate=DROPOUT_RATE
+        )
+
+        trainer.build_model()
+        trainer.compile_model(LEARNING_RATE)
     
     # Train
     print("Training...")
