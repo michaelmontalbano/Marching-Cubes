@@ -5,6 +5,8 @@ import importlib
 import inspect
 import logging
 import os
+import shutil
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, Optional
@@ -13,6 +15,105 @@ import tensorflow as tf
 from tensorflow import keras as tfk
 
 from . import config as cfg
+
+try:  # Optional dependency used only for legacy checkpoints
+    import h5py
+except Exception:  # pragma: no cover - environments without h5py
+    h5py = None
+
+
+_Conv2DTranspose = tfk.layers.Conv2DTranspose
+_CONV2D_TRANSPOSE_PATCHED = False
+
+
+def _patch_conv2d_transpose() -> None:
+    """Ensure legacy HDF5 configs with a ``groups`` key load correctly."""
+
+    global _CONV2D_TRANSPOSE_PATCHED
+    if _CONV2D_TRANSPOSE_PATCHED:
+        return
+
+    original = getattr(_Conv2DTranspose, "from_config", None)
+    if original is None:
+        return
+
+    original_func = getattr(original, "__func__", None)
+    if original_func is None:
+        return
+
+    @classmethod
+    def _patched_from_config(cls, config):  # type: ignore[override]
+        cfg = dict(config)
+        cfg.pop("groups", None)
+        return original_func(cls, cfg)
+
+    _Conv2DTranspose.from_config = _patched_from_config
+    _CONV2D_TRANSPOSE_PATCHED = True
+
+
+_patch_conv2d_transpose()
+
+
+class _LegacyConv2DTranspose(tfk.layers.Conv2DTranspose):
+    """Kept for completeness; used when explicit custom objects are required."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.pop("groups", None)
+        super().__init__(*args, **kwargs)
+
+
+_LambdaLayer = tfk.layers.Lambda
+_original_lambda_compute_output_shape = _LambdaLayer.compute_output_shape
+
+
+def _safe_lambda_compute_output_shape(self, input_shape):
+    """Best-effort Lambda shape inference for legacy H5 checkpoints."""
+
+    try:
+        return _original_lambda_compute_output_shape(self, input_shape)
+    except NotImplementedError:
+        # Fallback heuristics mimic the common identity/reshape lambdas used in
+        # the historic ConvGRU exporter where the batch axis is unchanged.
+        if isinstance(input_shape, (list, tuple)):
+            if not input_shape:
+                return input_shape
+            # Single input stored in a tuple/list.
+            if len(input_shape) == 1:
+                return input_shape[0]
+            return input_shape[0]
+        return input_shape
+
+
+if getattr(_LambdaLayer.compute_output_shape, "__name__", "") != _safe_lambda_compute_output_shape.__name__:
+    _LambdaLayer.compute_output_shape = _safe_lambda_compute_output_shape
+
+
+def _fallback_weighted_mse():
+    """Return a minimal weighted MSE implementation for ConvGRU checkpoints."""
+
+    def loss(y_true, y_pred):
+        mse = tf.square(y_true - y_pred)
+        timesteps = tf.shape(y_true)[1]
+        timestep_weights = tf.range(1, timesteps + 1, dtype=tf.float32)
+        timestep_weights = tf.reshape(timestep_weights, (1, timesteps, 1, 1, 1))
+        return mse * timestep_weights
+
+    return loss
+
+
+def _fallback_csi(threshold: float = 20.0):
+    """Simplified CSI metric used by historic ConvGRU training runs."""
+
+    def metric(y_true, y_pred):
+        y_pred_binary = tf.cast(y_pred > threshold, tf.float32)
+        y_true_binary = tf.cast(y_true > threshold, tf.float32)
+
+        tp = tf.reduce_sum(y_true_binary[:, -1] * y_pred_binary[:, -1])
+        fn = tf.reduce_sum(y_true_binary[:, -1] * (1 - y_pred_binary[:, -1]))
+        fp = tf.reduce_sum((1 - y_true_binary[:, -1]) * y_pred_binary[:, -1])
+        return tp / tf.maximum(tp + fn + fp, 1.0)
+
+    return metric
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +157,14 @@ def _load_flow_custom_objects() -> Dict[str, object]:
 
 
 def _convgru_custom_objects() -> Dict[str, object]:
-    from models import weighted_mse, csi
+    try:
+        module = importlib.import_module("models")
+        weighted_mse = module.weighted_mse
+        csi = module.csi
+    except Exception as exc:  # pragma: no cover - logging fallback path
+        logger.warning("Falling back to bundled ConvGRU losses: %s", exc)
+        weighted_mse = _fallback_weighted_mse
+        csi = _fallback_csi()
     from rnn import (
         reshape_and_stack,
         slice_to_n_steps,
@@ -71,10 +179,12 @@ def _convgru_custom_objects() -> Dict[str, object]:
         GRUResBlock,
     )
 
+    loss_fn = weighted_mse()
     return {
-        "loss": weighted_mse(),
-        "weighted_mse": weighted_mse(),
+        "loss": loss_fn,
+        "weighted_mse": loss_fn,
         "csi": csi,
+        "Conv2DTranspose": _LegacyConv2DTranspose,
         "reshape_and_stack": reshape_and_stack,
         "slice_to_n_steps": slice_to_n_steps,
         "slice_output_shape": slice_output_shape,
@@ -116,6 +226,30 @@ class ModelLoader:
         explicit_type = ModelType.from_string(config.model_type) if config.model_type else None
         model_type = explicit_type or _guess_model_type(model_path)
         custom_objects = _custom_objects_for(model_type)
-        model = tfk.models.load_model(model_path, custom_objects=custom_objects, compile=False)
+        model = self._load_with_fallbacks(model_path, custom_objects)
         logger.info("Loaded %s model from %s", model_type.value, model_path)
         return LoadedModel(model=model, model_type=model_type)
+
+    @staticmethod
+    def _load_with_fallbacks(path: str, custom_objects: Dict[str, object]) -> tfk.Model:
+        try:
+            return tfk.models.load_model(path, custom_objects=custom_objects, compile=False)
+        except ValueError as exc:
+            message = str(exc)
+            if (
+                "accessible `.keras` zip file" in message
+                and h5py is not None
+                and h5py.is_hdf5(path)
+            ):
+                logger.info("Detected legacy HDF5 checkpoint stored with .keras suffix; reloading via temporary .h5 copy")
+                with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+                    temp_path = tmp.name
+                try:
+                    shutil.copy2(path, temp_path)
+                    return tfk.models.load_model(temp_path, custom_objects=custom_objects, compile=False)
+                finally:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+            raise
