@@ -66,20 +66,6 @@ _LambdaLayer = tfk.layers.Lambda
 _original_lambda_compute_output_shape = _LambdaLayer.compute_output_shape
 
 
-def _as_shape_tuple(shape) -> tuple:
-    """Convert ``shape`` to a tuple compatible with Keras shape semantics."""
-
-    if isinstance(shape, tf.TensorShape):
-        return tuple(shape.as_list())
-    try:
-        tensor_shape = tf.TensorShape(shape)
-    except (TypeError, ValueError):
-        if isinstance(shape, (list, tuple)):
-            return tuple(shape)
-        return (None,)
-    return tuple(tensor_shape.as_list())
-
-
 def _safe_lambda_compute_output_shape(self, input_shape):
     """Best-effort Lambda shape inference for legacy H5 checkpoints."""
 
@@ -90,12 +76,12 @@ def _safe_lambda_compute_output_shape(self, input_shape):
         # the historic ConvGRU exporter where the batch axis is unchanged.
         if isinstance(input_shape, (list, tuple)):
             if not input_shape:
-                return tuple()
+                return input_shape
             # Single input stored in a tuple/list.
             if len(input_shape) == 1:
-                return _as_shape_tuple(input_shape[0])
-            return _as_shape_tuple(input_shape[0])
-        return _as_shape_tuple(input_shape)
+                return input_shape[0]
+            return input_shape[0]
+        return input_shape
 
 
 if getattr(_LambdaLayer.compute_output_shape, "__name__", "") != _safe_lambda_compute_output_shape.__name__:

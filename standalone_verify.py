@@ -53,19 +53,6 @@ def _ensure_positive_int(value: str) -> int:
     return parsed
 
 
-def _parse_n_tiles(value: str) -> Optional[int]:
-    lowered = value.strip().lower()
-    if lowered in {"", "all", "everything", "full", "max", "none", "*"}:
-        return None
-    try:
-        parsed = int(lowered)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("--n_tiles must be a positive integer or 'everything'") from exc
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("--n_tiles must be positive")
-    return parsed
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_path", required=True, help="Path to the model checkpoint to evaluate")
@@ -80,8 +67,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Tile size for sliding-window inference")
     parser.add_argument("--stride", type=_ensure_positive_int, default=128,
                         help="Stride for sliding-window inference")
-    parser.add_argument("--n_tiles", type=_parse_n_tiles, default=None,
-                        help="Limit the number of tiles processed during inference")
     parser.add_argument("--mrms_bucket", default="noaa-mrms-pds", help="S3 bucket containing MRMS data")
     parser.add_argument("--model_bucket", default="dev-grib-bucket", help="Bucket for normalization arrays")
     parser.add_argument("--norm_min_key", default="global_mins.npy", help="Key for global minima array")
@@ -150,14 +135,12 @@ class TiledPredictor:
         tile_size: int,
         stride: int,
         flow_steps: int,
-        max_tiles: Optional[int] = None,
     ) -> None:
         self.model = model
         self.model_type = model_type
         self.tile_size = tile_size
         self.stride = stride
         self.flow_steps = flow_steps
-        self.max_tiles = max_tiles
 
     def predict(self, tensor: np.ndarray) -> np.ndarray:
         timesteps, height, width, _ = tensor.shape
@@ -174,10 +157,6 @@ class TiledPredictor:
                 tiles_processed += 1
                 if tiles_processed % 100 == 0:
                     logging.getLogger(__name__).info("Processed %d tiles", tiles_processed)
-                if self.max_tiles is not None and tiles_processed >= self.max_tiles:
-                    break
-            if self.max_tiles is not None and tiles_processed >= self.max_tiles:
-                break
 
         mask = counts > 0
         predictions[mask] /= counts[mask]
@@ -353,7 +332,6 @@ def main() -> None:
         model_path=args.model_path,
         model_type=args.model_type,
         flow_steps=args.flow_steps,
-        n_tiles=args.n_tiles,
     )
     loaded = ModelLoader().load(config)
     predictor = TiledPredictor(
@@ -362,7 +340,6 @@ def main() -> None:
         tile_size=args.tile_size,
         stride=args.stride,
         flow_steps=args.flow_steps,
-        max_tiles=args.n_tiles,
     )
 
     output_dir = Path(args.output_dir)
