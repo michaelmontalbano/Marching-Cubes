@@ -7,7 +7,7 @@ import os
 import shutil
 from bisect import bisect_left
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import boto3
@@ -19,8 +19,18 @@ from scipy.ndimage import binary_dilation, zoom
 
 logger = logging.getLogger(__name__)
 
-
 MRMS_TIME_FORMAT = "%Y%m%d-%H%M%S"
+
+
+def _as_naive_utc(dt: datetime) -> datetime:
+    """
+    Return a timezone-naive datetime in UTC.
+    - If dt is aware, convert to UTC and drop tzinfo.
+    - If dt is naive, return as-is (assumed UTC).
+    """
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 @dataclass
@@ -115,13 +125,17 @@ class MRMSDataBuilder:
         return keys
 
     def _gather_and_sort_files(self, target_dt: datetime, field: str) -> List[Tuple[datetime, str]]:
+        # Normalize to naive UTC for date math and prefix construction
+        target_dt = _as_naive_utc(target_dt)
+
         date_str = target_dt.strftime("%Y%m%d")
         cache_key = (field, date_str)
         if cache_key in self._parsed_cache:
             return self._parsed_cache[cache_key]
 
         prefixes = [f"CONUS/{field}/{date_str}/"]
-        if target_dt.hour == 0 and target_dt.minute < 60:
+        # Also consider adjacent days near midnight boundaries
+        if target_dt.hour == 0:
             prev = (target_dt - timedelta(days=1)).strftime("%Y%m%d")
             prefixes.append(f"CONUS/{field}/{prev}/")
         if target_dt.hour == 23:
@@ -136,7 +150,7 @@ class MRMSDataBuilder:
         for key in keys:
             try:
                 timestamp = key.split("_")[-1].split(".")[0]
-                parsed_dt = datetime.strptime(timestamp, MRMS_TIME_FORMAT)
+                parsed_dt = datetime.strptime(timestamp, MRMS_TIME_FORMAT)  # naive (UTC)
                 parsed.append((parsed_dt, key))
             except Exception:
                 continue
@@ -149,7 +163,10 @@ class MRMSDataBuilder:
     def _find_closest(entries: Sequence[Tuple[datetime, str]], target: datetime) -> Optional[str]:
         if not entries:
             return None
-        times = [item[0] for item in entries]
+        # Ensure target is timezone-naive UTC to match parsed entry datetimes
+        target = _as_naive_utc(target)
+
+        times = [item[0] for item in entries]  # all naive UTC
         position = bisect_left(times, target)
         if position == 0:
             return entries[0][1]
@@ -205,6 +222,9 @@ class MRMSDataBuilder:
         target_dt: datetime,
         normalization: NormalizationArrays,
     ) -> np.ndarray:
+        # Normalize once at entry
+        target_dt = _as_naive_utc(target_dt)
+
         logger.info("Building input tensor for %s", target_dt.isoformat())
         data = np.zeros(
             (
@@ -254,6 +274,9 @@ class MRMSDataBuilder:
         return normalized
 
     def build_ground_truth(self, target_dt: datetime) -> np.ndarray:
+        # Normalize once at entry
+        target_dt = _as_naive_utc(target_dt)
+
         logger.info("Building ground truth for %s", target_dt.isoformat())
         entries = self._gather_and_sort_files(target_dt, self.config.mesh_field)
         arrays: List[np.ndarray] = []
@@ -335,4 +358,3 @@ class MRMSDataBuilder:
                 float(channel.max()),
                 float(channel.mean()),
             )
-
