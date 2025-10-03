@@ -262,7 +262,10 @@ class MRMSDataBuilder:
         self,
         target_dt: datetime,
         normalization: NormalizationArrays,
-    ) -> np.ndarray:
+        *,
+        normalize: bool = True,
+        return_raw: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         # Normalize once at entry
         target_dt = _as_naive_utc(target_dt)
 
@@ -310,8 +313,13 @@ class MRMSDataBuilder:
                     data[timestep_idx, ..., 7] = self._enlarge_hail_region(array)
 
         self._log_channel_stats("before normalization", data)
-        normalized = self._normalize(data, normalization)
-        self._log_channel_stats("after normalization", normalized)
+        if normalize:
+            normalized = self._normalize(data, normalization)
+            self._log_channel_stats("after normalization", normalized)
+        else:
+            normalized = data.copy()
+        if return_raw:
+            return normalized.copy(), data.copy()
         return normalized
 
     def build_ground_truth(self, target_dt: datetime) -> np.ndarray:

@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from evaluation.config import StandaloneConfig
-from evaluation.data import S3ArtifactLoader
+from evaluation.data import NormalizationBundle, S3ArtifactLoader
 from evaluation.models import ModelLoader, ModelType
 from evaluation.plotting import plot_ground_truth_prediction_difference
 from evaluation.mrms import MRMSConfig, MRMSDataBuilder, NormalizationArrays
@@ -53,6 +53,23 @@ def _ensure_positive_int(value: str) -> int:
     return parsed
 
 
+def _parse_n_tiles(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered in {"", "all", "everything", "full", "max", "none", "*"}:
+        return None
+    try:
+        parsed = int(lowered)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--n_tiles must be a positive integer or 'everything'"
+        ) from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("--n_tiles must be positive")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_path", required=True, help="Path to the model checkpoint to evaluate")
@@ -67,6 +84,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Tile size for sliding-window inference")
     parser.add_argument("--stride", type=_ensure_positive_int, default=128,
                         help="Stride for sliding-window inference")
+    parser.add_argument("--n_tiles", type=_parse_n_tiles, default=None,
+                        help="Number of tiles to sample for debugging output")
     parser.add_argument("--mrms_bucket", default="noaa-mrms-pds", help="S3 bucket containing MRMS data")
     parser.add_argument("--model_bucket", default="dev-grib-bucket", help="Bucket for normalization arrays")
     parser.add_argument("--norm_min_key", default="global_mins.npy", help="Key for global minima array")
@@ -129,6 +148,18 @@ class PredictionSummary:
     ground_truth: np.ndarray
     metrics: ThresholdResults
     plot_path: Optional[str]
+    tiles: List["TileDebugInfo"]
+
+
+@dataclass
+class TileDebugInfo:
+    index: int
+    y: int
+    x: int
+    prediction: np.ndarray
+    normalized_inputs: np.ndarray
+    raw_inputs: Optional[np.ndarray]
+    plot_path: Optional[str] = None
 
 
 class TiledPredictor:
@@ -148,11 +179,18 @@ class TiledPredictor:
         self.stride = stride
         self.flow_steps = flow_steps
 
-    def predict(self, tensor: np.ndarray) -> np.ndarray:
+    def predict(
+        self,
+        tensor: np.ndarray,
+        raw_tensor: Optional[np.ndarray] = None,
+        debug_limit: Optional[int] = None,
+    ) -> tuple[np.ndarray, List[TileDebugInfo]]:
         timesteps, height, width, _ = tensor.shape
         predictions = np.zeros((timesteps, height, width), dtype=np.float32)
         counts = np.zeros((timesteps, height, width), dtype=np.float32)
         tiles_processed = 0
+        debug_tiles: List[TileDebugInfo] = []
+        tile_index = 0
 
         for y in range(0, height - self.tile_size + 1, self.stride):
             for x in range(0, width - self.tile_size + 1, self.stride):
@@ -161,6 +199,23 @@ class TiledPredictor:
                 predictions[:, y : y + self.tile_size, x : x + self.tile_size] += sequence
                 counts[:, y : y + self.tile_size, x : x + self.tile_size] += 1
                 tiles_processed += 1
+                if debug_limit is not None and len(debug_tiles) < debug_limit:
+                    raw_slice: Optional[np.ndarray] = None
+                    if raw_tensor is not None:
+                        raw_slice = raw_tensor[
+                            :, y : y + self.tile_size, x : x + self.tile_size, :
+                        ].copy()
+                    debug_tiles.append(
+                        TileDebugInfo(
+                            index=tile_index,
+                            y=y,
+                            x=x,
+                            prediction=sequence.copy(),
+                            normalized_inputs=tile.copy(),
+                            raw_inputs=raw_slice,
+                        )
+                    )
+                tile_index += 1
                 if tiles_processed % 100 == 0:
                     logging.getLogger(__name__).info("Processed %d tiles", tiles_processed)
 
@@ -171,7 +226,7 @@ class TiledPredictor:
         if uncovered:
             logging.getLogger(__name__).warning("%d pixels were not covered by any tile", uncovered)
         logging.getLogger(__name__).info("Processed %d total tiles", tiles_processed)
-        return predictions
+        return predictions, debug_tiles
 
     def _predict_tile(self, tile: np.ndarray) -> np.ndarray:
         if self.model_type is ModelType.FLOW:
@@ -298,19 +353,97 @@ def _print_metrics(metrics: ThresholdResults) -> None:
         )
 
 
+def _summarize_array(label: str, array: np.ndarray) -> None:
+    print(
+        f"    {label}: min={float(array.min()):.3f}, max={float(array.max()):.3f}, "
+        f"mean={float(array.mean()):.3f}"
+    )
+
+
+def _summarize_channels(label: str, array: np.ndarray) -> None:
+    _summarize_array(label, array)
+    if array.ndim >= 4:
+        for channel_idx in range(array.shape[-1]):
+            channel_slice = array[..., channel_idx]
+            print(
+                f"      Channel {channel_idx}: min={float(channel_slice.min()):.3f}, "
+                f"max={float(channel_slice.max()):.3f}, mean={float(channel_slice.mean()):.3f}"
+            )
+
+
+def _process_tile_debug_information(
+    tiles: List[TileDebugInfo],
+    ground_truth: np.ndarray,
+    lead_index: int,
+    lead_time: int,
+    output_dir: Path,
+    plot: bool,
+) -> None:
+    if not tiles:
+        return
+
+    print("\n" + "=" * 60)
+    print("TILE DEBUG STATISTICS")
+    print("=" * 60)
+
+    tile_plot_dir = output_dir / "tiles"
+    if plot:
+        _ensure_directory(tile_plot_dir)
+
+    for display_idx, tile in enumerate(tiles, start=1):
+        print(
+            f"\nTile {display_idx} (index {tile.index}) origin=(y={tile.y}, x={tile.x})"
+        )
+        if tile.raw_inputs is not None:
+            _summarize_channels("Raw inputs", tile.raw_inputs)
+        _summarize_channels("Normalized inputs", tile.normalized_inputs)
+        prediction_frame = tile.prediction[lead_index]
+        _summarize_array("Prediction", prediction_frame)
+        gt_tile = ground_truth[
+            tile.y : tile.y + prediction_frame.shape[0],
+            tile.x : tile.x + prediction_frame.shape[1],
+        ]
+        _summarize_array("Ground truth", gt_tile)
+
+        if plot:
+            filename = f"tile_{tile.index:05d}_lead{lead_time:03d}.png"
+            plot_path = plot_ground_truth_prediction_difference(
+                ground_truth=gt_tile,
+                prediction=prediction_frame,
+                title=f"Tile {tile.index} (+{lead_time}m)",
+                output_dir=str(tile_plot_dir),
+                filename=filename,
+            )
+            tile.plot_path = plot_path
+            if plot_path:
+                logging.getLogger(__name__).info(
+                    "Wrote tile comparison plot to %s", plot_path
+                )
 def run_verification(
     target_dt: datetime,
     lead_time: int,
     builder: MRMSDataBuilder,
-    normalization: NormalizationArrays,
+    normalization_arrays: NormalizationArrays,
+    normalization_bundle: NormalizationBundle,
     predictor: TiledPredictor,
     output_dir: Path,
     plot: bool,
+    tile_limit: Optional[int],
 ) -> PredictionSummary:
     if lead_time % 5 != 0:
         raise ValueError("Lead time must be a multiple of 5 minutes")
-    input_tensor = builder.build_input_tensor(target_dt, normalization)
-    prediction_sequence = predictor.predict(input_tensor)
+    raw_inputs = builder.build_input_tensor(
+        target_dt,
+        normalization_arrays,
+        normalize=False,
+    )
+    raw_inputs = raw_inputs[::-1, :, :, :]
+    normalized_inputs = normalization_bundle.normalize(raw_inputs)
+    prediction_sequence, tile_debug = predictor.predict(
+        normalized_inputs,
+        raw_tensor=raw_inputs,
+        debug_limit=tile_limit,
+    )
 
     lead_index = lead_time // 5 - 1
     if lead_index < 0 or lead_index >= prediction_sequence.shape[0]:
@@ -343,7 +476,22 @@ def run_verification(
         if plot_path:
             logging.getLogger(__name__).info("Wrote comparison plot to %s", plot_path)
 
-    return PredictionSummary(prediction=prediction, ground_truth=ground_truth, metrics=metrics, plot_path=plot_path)
+    _process_tile_debug_information(
+        tile_debug,
+        ground_truth,
+        lead_index,
+        lead_time,
+        output_dir,
+        plot,
+    )
+
+    return PredictionSummary(
+        prediction=prediction,
+        ground_truth=ground_truth,
+        metrics=metrics,
+        plot_path=plot_path,
+        tiles=tile_debug,
+    )
 
 
 def save_outputs(summary: PredictionSummary, target_dt: datetime, lead_time: int, output_dir: Path) -> None:
@@ -375,6 +523,10 @@ def main() -> None:
     datetimes = [_parse_datetime(value) for value in args.datetimes]
     loader = S3ArtifactLoader(cache_dir=args.cache_dir)
     normalization = load_normalization_arrays(loader, args.model_bucket, args.norm_min_key, args.norm_max_key)
+    normalization_bundle = NormalizationBundle(
+        global_min=normalization.global_min.copy(),
+        global_max=normalization.global_max.copy(),
+    )
 
     mrms_config = MRMSConfig(
         bucket=args.mrms_bucket,
@@ -407,9 +559,11 @@ def main() -> None:
             args.lead_time,
             builder,
             normalization,
+            normalization_bundle,
             predictor,
             output_dir,
             plot=not args.no_plots,
+            tile_limit=args.n_tiles,
         )
         if args.save_outputs:
             save_outputs(summary, dt, args.lead_time, output_dir)
