@@ -153,6 +153,7 @@ def _rebuild_and_load_flow_h5_weights(h5_path: str) -> tfk.Model:
     # In Keras 3, load_weights can read from a full-model H5; skip mismatches just in case.
     try:
         model.load_weights(h5_path, skip_mismatch=True)
+        # model.assert_consumed()
         logger.info("Loaded weights from %s into rebuilt FlowMatchingUNet (filters=%d).", h5_path, init_filters)
     except Exception as exc:
         logger.error("Failed to load weights from %s: %s", h5_path, exc)
