@@ -1,629 +1,372 @@
 #!/usr/bin/env python3
-"""
-Evaluate MESH - 60-minute swath predictions
+"""Standalone MESH verification using on-demand MRMS downloads."""
+from __future__ import annotations
 
-Evaluates model predictions against the 60-minute MESH swath target.
-- Loads best_model_intervals.keras
-- Evaluates all 12 prediction timesteps against the 60-minute swath
-- Calculates CSI, POD, FAR, and Bias metrics
-- Finds optimal prediction thresholds for each observation threshold
-"""
-
-import os
+import argparse
 import json
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, List, Optional
+
 import numpy as np
-import pandas as pd
-import boto3
-from io import BytesIO
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
 
-# ---------------- TensorFlow / Keras & custom layers ----------------
-import tensorflow as tf
-from tensorflow import keras as tfk
+from evaluation.config import StandaloneConfig
+from evaluation.data import S3ArtifactLoader
+from evaluation.models import ModelLoader, ModelType
+from evaluation.plotting import plot_ground_truth_prediction_difference
+from evaluation.mrms import MRMSConfig, MRMSDataBuilder, NormalizationArrays
 
-# Import custom objects from modules - REQUIRED for model loading
-try:
-    from rnn import (
-        reshape_and_stack, slice_to_n_steps, slice_output_shape,
-        ResBlock, WarmUpCosineDecayScheduler, ConvGRU, ConvBlock,
-        ZeroLikeLayer, ReflectionPadding2D, ResGRU, GRUResBlock
-    )
-    from models import weighted_mse, csi, focal_mse, combined_loss
-    logger.info("Successfully imported custom objects from rnn and models modules")
-except ImportError as e:
-    logger.error(f"CRITICAL: Cannot import required modules - {e}")
-    logger.error("Make sure rnn.py and models.py are in the same directory or in PYTHONPATH")
-    raise ImportError("Required modules rnn.py and models.py not found. These are required for model loading.")
 
-# ---------------- Channel indices ----------------
-C_MESH60    = 0  # MESH_Max_60min (target channel)
-C_MESH      = 1  # MESH (raw)
-C_HCR       = 2  # HeightCompositeReflectivity
-C_ECHOTOP50 = 3  # EchoTop_50
-C_PRECIP    = 4  # PrecipRate
-C_REF0C     = 5  # Reflectivity_0C
-C_REFm20    = 6  # Reflectivity_-20C
-C_MESH_DIL  = 7  # MESH dil mask (binary)
-NORM_CHANNELS = (C_MESH60, C_MESH, C_HCR, C_ECHOTOP50, C_PRECIP, C_REF0C, C_REFm20)
-
-# ---------------- Logging ----------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+THRESHOLDS = np.array([5, 10, 20, 30, 40, 50, 70], dtype=float)
+SUGGESTED_DATES = (
+    "2025-05-28T22:00Z",
+    "2025-05-27T18:00Z",
+    "2025-05-26T20:20Z",
+    "2025-04-10T23:00Z",
 )
-logger = logging.getLogger("evaluate_mesh_60min")
 
-# ---------------- Config ----------------
-class Config:
-    # Buckets / paths
-    MODEL_BUCKET       = os.getenv('MODEL_BUCKET', 'dev-grib-bucket')
-    TEST_DF_BUCKET     = os.getenv('TEST_DF_BUCKET', MODEL_BUCKET)
-    MODEL_S3_PATH      = os.getenv('MODEL_S3_PATH', 'models/best_model_intervals.keras')
-    TEST_DF_PATH       = os.getenv('TEST_DF_PATH', 'dataframes/test.csv')
-    NORMALIZATION_MIN_PATH = os.getenv('NORMALIZATION_MIN_PATH', 'global_mins3.npy')
-    NORMALIZATION_MAX_PATH = os.getenv('NORMALIZATION_MAX_PATH', 'global_maxs3.npy')
 
-    # Writable roots
-    RESULTS_ROOT      = os.getenv('RESULTS_ROOT', './evaluation_results')
-    MODEL_CACHE_ROOT  = os.getenv('MODEL_CACHE_ROOT', './model_cache')
-    DATA_CACHE_ROOT   = os.getenv('DATA_CACHE_ROOT', './data')
+def _parse_datetime(value: str) -> datetime:
+    text = value.strip()
+    if not text:
+        raise argparse.ArgumentTypeError("Datetime string cannot be empty")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:  # pragma: no cover - defensive parsing
+        raise argparse.ArgumentTypeError(f"Unable to parse datetime '{value}'") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
-    # Eval set
-    NUM_SAMPLES = int(os.getenv('NUM_SAMPLES', '100'))
 
-    # All timesteps (0-11) corresponding to 0-55 minutes in 5-minute intervals
-    TIMESTEPS = np.arange(0, 12)
-    CHANNELS  = np.arange(0, 8)
+def _ensure_positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Value must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("Value must be positive")
+    return parsed
 
-    # Thresholds (mm)
-    OBS_THRESHOLDS = [5, 10, 20, 30, 40, 50, 70]
-    
-    # Prediction threshold search range
-    PRED_CUTOFF_MIN  = 1.0
-    PRED_CUTOFF_MAX  = 60.0
-    PRED_CUTOFF_STEP = 1.0
 
-    @property
-    def MODEL_NAME(self):
-        return os.path.splitext(os.path.basename(self.MODEL_S3_PATH))[0]
-    @property
-    def MODEL_CACHE_DIR(self):
-        return os.path.join(self.MODEL_CACHE_ROOT, self.MODEL_NAME)
-    @property
-    def RESULTS_DIR(self):
-        return os.path.join(self.RESULTS_ROOT, self.MODEL_NAME)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model_path", required=True, help="Path to the model checkpoint to evaluate")
+    parser.add_argument("--model_type", choices=["convgru", "flow"], help="Explicitly select the model family")
+    parser.add_argument("--datetime", dest="datetimes", action="append", required=True,
+                        help="Target datetime (ISO8601, repeatable)")
+    parser.add_argument("--lead_time", type=_ensure_positive_int, default=60,
+                        help="Lead time in minutes to verify (default: 60)")
+    parser.add_argument("--flow_steps", type=_ensure_positive_int, default=64,
+                        help="Euler integration steps for diffusion flow models")
+    parser.add_argument("--tile_size", type=_ensure_positive_int, default=256,
+                        help="Tile size for sliding-window inference")
+    parser.add_argument("--stride", type=_ensure_positive_int, default=128,
+                        help="Stride for sliding-window inference")
+    parser.add_argument("--mrms_bucket", default="noaa-mrms-pds", help="S3 bucket containing MRMS data")
+    parser.add_argument("--model_bucket", default="dev-grib-bucket", help="Bucket for normalization arrays")
+    parser.add_argument("--norm_min_key", default="global_mins.npy", help="Key for global minima array")
+    parser.add_argument("--norm_max_key", default="global_maxs.npy", help="Key for global maxima array")
+    parser.add_argument("--cache_dir", default="./cache", help="Local cache directory for S3 downloads")
+    parser.add_argument("--output_dir", default="./standalone_outputs",
+                        help="Directory where artifacts (plots, npy, json) are written")
+    parser.add_argument("--no_plots", action="store_true", help="Disable plot generation")
+    parser.add_argument("--save_outputs", action="store_true", help="Persist prediction/ground-truth arrays to disk")
+    parser.add_argument("--log_level", default="INFO", help="Logging level")
+    return parser
 
-# ---------------- S3 Loader ----------------
-class DataLoader:
-    def __init__(self, s3, data_root: str):
-        self.s3 = s3
-        self.cache_dir = data_root
-        os.makedirs(self.cache_dir, exist_ok=True)
 
-    def _cache_path(self, bucket: str, key: str) -> str:
-        path = os.path.join(self.cache_dir, bucket, key)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        return path
-
-    def load_numpy(self, bucket: str, key: str) -> Optional[np.ndarray]:
-        cp = self._cache_path(bucket, key)
-        if os.path.exists(cp):
-            try:
-                return np.load(cp, allow_pickle=False)
-            except Exception:
-                try: os.remove(cp)
-                except Exception: pass
+def _load_local_array(path: Path) -> Optional[np.ndarray]:
+    if path.exists():
         try:
-            obj = self.s3.get_object(Bucket=bucket, Key=key)
-            data = obj['Body'].read()
-            with open(cp, 'wb') as f: f.write(data)
-            return np.load(BytesIO(data), allow_pickle=False)
-        except Exception as e:
-            logger.error(f"Failed to load numpy s3://{bucket}/{key}: {e}")
-            return None
+            return np.load(path)
+        except Exception:
+            logging.getLogger(__name__).warning("Failed to read local array %s", path)
+    return None
 
-    def load_csv(self, bucket: str, key: str) -> Optional[pd.DataFrame]:
-        cp = self._cache_path(bucket, key.replace('/', '_'))
-        if os.path.exists(cp):
-            try:
-                return pd.read_csv(cp)
-            except Exception:
-                try: os.remove(cp)
-                except Exception: pass
-        try:
-            obj = self.s3.get_object(Bucket=bucket, Key=key)
-            data = obj['Body'].read()
-            df = pd.read_csv(BytesIO(data))
-            df.to_csv(cp, index=False)
-            return df
-        except Exception as e:
-            logger.error(f"Failed to load CSV s3://{bucket}/{key}: {e}")
-            return None
 
-    @staticmethod
-    def normalize_inputs(x: np.ndarray, gmins: np.ndarray, gmaxs: np.ndarray) -> np.ndarray:
-        """Normalize channels in NORM_CHANNELS to ~[0,1]; mask stays 0/1."""
-        x = x.astype(np.float32, copy=False)
-        T, H, W, C = x.shape
-        out = np.zeros_like(x, dtype=np.float32)
-        for t in range(T):
-            for c in range(C):
-                arr = x[t, :, :, c]
-                if c in NORM_CHANNELS:
-                    mn, mx = float(gmins[c]), float(gmaxs[c])
-                    if not np.isfinite(mn) or not np.isfinite(mx) or mx <= mn:
-                        mn = float(np.nanmin(arr)) if np.isfinite(np.nanmin(arr)) else 0.0
-                        mx = float(np.nanmax(arr)) if np.isfinite(np.nanmax(arr)) else (mn + 1.0)
-                        if mx <= mn: mx = mn + 1.0
-                    out[t, :, :, c] = np.clip((arr - mn) / (mx - mn + 1e-5), 1e-5, 1.0)
-                else:
-                    out[t, :, :, c] = arr
-        return out
+def load_normalization_arrays(
+    loader: S3ArtifactLoader,
+    bucket: str,
+    min_key: str,
+    max_key: str,
+) -> NormalizationArrays:
+    min_local = Path(Path(min_key).name)
+    max_local = Path(Path(max_key).name)
+    global_min = _load_local_array(min_local)
+    if global_min is None:
+        logging.getLogger(__name__).info("Downloading normalization minima from s3://%s/%s", bucket, min_key)
+        arr = loader.load_numpy(bucket, min_key)
+        if arr is None:
+            raise RuntimeError(f"Unable to load normalization minima from s3://{bucket}/{min_key}")
+        np.save(min_local, arr)
+        global_min = arr
+    global_max = _load_local_array(max_local)
+    if global_max is None:
+        logging.getLogger(__name__).info("Downloading normalization maxima from s3://%s/%s", bucket, max_key)
+        arr = loader.load_numpy(bucket, max_key)
+        if arr is None:
+            raise RuntimeError(f"Unable to load normalization maxima from s3://{bucket}/{max_key}")
+        np.save(max_local, arr)
+        global_max = arr
+    return NormalizationArrays(global_min=np.asarray(global_min, dtype=np.float32),
+                               global_max=np.asarray(global_max, dtype=np.float32))
 
-# ---------------- Metrics Calculation ----------------
-class MetricsCalculator:
-    """Calculate metrics for 60-minute swath predictions"""
-    
-    def __init__(self, pred_thresholds, obs_thresholds):
-        self.pred_thr = np.asarray(pred_thresholds, dtype=float)
-        self.obs_thr = np.asarray(obs_thresholds, dtype=float)
-        P, O = len(self.pred_thr), len(self.obs_thr)
-        
-        # Accumulate stats for each timestep separately
-        self.timestep_stats = {}
-        for t in range(12):
-            self.timestep_stats[t] = {
-                'tp': np.zeros((P, O), dtype=np.int64),
-                'fp': np.zeros((P, O), dtype=np.int64),
-                'fn': np.zeros((P, O), dtype=np.int64)
-            }
-        
-        # Also keep overall stats
-        self.overall_tp = np.zeros((P, O), dtype=np.int64)
-        self.overall_fp = np.zeros((P, O), dtype=np.int64)
-        self.overall_fn = np.zeros((P, O), dtype=np.int64)
 
-    def update(self, predictions: np.ndarray, target_60min: np.ndarray):
-        """
-        Update metrics with a single sample's predictions and target.
-        
-        Args:
-            predictions: (12, H, W, 1) - model predictions for each timestep
-            target_60min: (H, W) - 60-minute MESH swath target
-        """
-        target = target_60min.ravel()
-        
-        # Process each timestep
-        for t in range(predictions.shape[0]):
-            pred_t = predictions[t].squeeze().ravel()
-            
-            for p_i, p_thr in enumerate(self.pred_thr):
-                pred_pos = pred_t >= p_thr
-                not_pred = ~pred_pos
-                
-                for o_i, o_thr in enumerate(self.obs_thr):
-                    obs_pos = target >= o_thr
-                    
-                    tp = int(np.count_nonzero(pred_pos & obs_pos))
-                    fp = int(np.count_nonzero(pred_pos & ~obs_pos))
-                    fn = int(np.count_nonzero(not_pred & obs_pos))
-                    
-                    self.timestep_stats[t]['tp'][p_i, o_i] += tp
-                    self.timestep_stats[t]['fp'][p_i, o_i] += fp
-                    self.timestep_stats[t]['fn'][p_i, o_i] += fn
-                    
-                    # Add to overall stats
-                    self.overall_tp[p_i, o_i] += tp
-                    self.overall_fp[p_i, o_i] += fp
-                    self.overall_fn[p_i, o_i] += fn
+@dataclass
+class PredictionSummary:
+    prediction: np.ndarray
+    ground_truth: np.ndarray
+    metrics: Dict[float, Dict[str, float]]
+    plot_path: Optional[str]
 
-    def compute_metrics(self, tp, fp, fn):
-        """Compute CSI, POD, FAR, and Bias from counts"""
-        denom = tp + fp + fn
-        with np.errstate(divide='ignore', invalid='ignore'):
-            csi = np.where(denom > 0, tp / denom, 0.0)
-            pod = np.where((tp + fn) > 0, tp / (tp + fn), 0.0)
-            far = np.where((tp + fp) > 0, fp / (tp + fp), 0.0)
-            bias = np.where((tp + fn) > 0, (tp + fp) / (tp + fn), 0.0)
-        return csi, pod, far, bias
 
-    def finalize(self):
-        """Compute final metrics for all timesteps and overall"""
-        results = {}
-        
-        # Compute metrics for each timestep
-        for t in range(12):
-            stats = self.timestep_stats[t]
-            csi, pod, far, bias = self.compute_metrics(stats['tp'], stats['fp'], stats['fn'])
-            
-            # Find best prediction threshold for each observation threshold
-            best_idx = np.argmax(csi, axis=0)
-            best_metrics = pd.DataFrame({
-                "obs_threshold": self.obs_thr,
-                "best_pred_threshold": self.pred_thr[best_idx],
-                "CSI": csi[best_idx, np.arange(len(self.obs_thr))],
-                "POD": pod[best_idx, np.arange(len(self.obs_thr))],
-                "FAR": far[best_idx, np.arange(len(self.obs_thr))],
-                "Bias": bias[best_idx, np.arange(len(self.obs_thr))]
-            })
-            
-            results[f'timestep_{t}'] = {
-                'minutes': t * 5,
-                'best_metrics': best_metrics.to_dict(orient='records'),
-                'csi_surface': csi.tolist(),
-                'pod_surface': pod.tolist(),
-                'far_surface': far.tolist(),
-                'bias_surface': bias.tolist()
-            }
-        
-        # Compute overall metrics (averaged across all timesteps)
-        overall_csi, overall_pod, overall_far, overall_bias = self.compute_metrics(
-            self.overall_tp / 12, self.overall_fp / 12, self.overall_fn / 12
+class TiledPredictor:
+    """Run tiled inference across the CONUS domain."""
+
+    def __init__(
+        self,
+        model,
+        model_type: ModelType,
+        tile_size: int,
+        stride: int,
+        flow_steps: int,
+    ) -> None:
+        self.model = model
+        self.model_type = model_type
+        self.tile_size = tile_size
+        self.stride = stride
+        self.flow_steps = flow_steps
+
+    def predict(self, tensor: np.ndarray) -> np.ndarray:
+        timesteps, height, width, _ = tensor.shape
+        predictions = np.zeros((timesteps, height, width), dtype=np.float32)
+        counts = np.zeros((timesteps, height, width), dtype=np.float32)
+        tiles_processed = 0
+
+        for y in range(0, height - self.tile_size + 1, self.stride):
+            for x in range(0, width - self.tile_size + 1, self.stride):
+                tile = tensor[:, y : y + self.tile_size, x : x + self.tile_size, :]
+                sequence = self._predict_tile(tile)
+                predictions[:, y : y + self.tile_size, x : x + self.tile_size] += sequence
+                counts[:, y : y + self.tile_size, x : x + self.tile_size] += 1
+                tiles_processed += 1
+                if tiles_processed % 100 == 0:
+                    logging.getLogger(__name__).info("Processed %d tiles", tiles_processed)
+
+        mask = counts > 0
+        predictions[mask] /= counts[mask]
+        predictions[predictions < 0.5] = 0.0
+        uncovered = np.count_nonzero(counts[0] == 0)
+        if uncovered:
+            logging.getLogger(__name__).warning("%d pixels were not covered by any tile", uncovered)
+        logging.getLogger(__name__).info("Processed %d total tiles", tiles_processed)
+        return predictions
+
+    def _predict_tile(self, tile: np.ndarray) -> np.ndarray:
+        if self.model_type is ModelType.FLOW:
+            return self._predict_flow_tile(tile)
+        return self._predict_convgru_tile(tile)
+
+    def _predict_convgru_tile(self, tile: np.ndarray) -> np.ndarray:
+        batch = np.expand_dims(tile, axis=0)
+        outputs = self.model.predict(batch, verbose=0)
+        if isinstance(outputs, (list, tuple)):
+            outputs = outputs[0]
+        array = np.asarray(outputs, dtype=np.float32)
+        if array.ndim == 5:
+            array = array[0, ..., 0]
+        elif array.ndim == 4:
+            array = array[0]
+        return array
+
+    def _predict_flow_tile(self, tile: np.ndarray) -> np.ndarray:
+        condition = np.expand_dims(tile.astype(np.float32), axis=0)
+        frames: List[np.ndarray] = []
+        n_steps = max(1, int(self.flow_steps))
+        dt = 1.0 / float(n_steps)
+        times = np.linspace(0.0, 1.0 - dt, n_steps, dtype=np.float32)
+
+        for timestep_idx in range(tile.shape[0]):
+            state = np.zeros((1, tile.shape[1], tile.shape[2], 1), dtype=np.float32)
+            timestep_value = np.array([float(timestep_idx)], dtype=np.float32)
+            for t_val in times:
+                inputs = {
+                    "x_t": state,
+                    "condition": condition,
+                    "t": np.array([t_val], dtype=np.float32),
+                    "timestep_idx": timestep_value,
+                }
+                velocity = self.model.predict(inputs, verbose=0)
+                if isinstance(velocity, (list, tuple)):
+                    velocity = velocity[0]
+                state = state + velocity.astype(np.float32) * dt
+            frames.append(state[0, ..., 0])
+        return np.stack(frames, axis=0)
+
+
+def compute_threshold_metrics(prediction: np.ndarray, ground_truth: np.ndarray) -> Dict[float, Dict[str, float]]:
+    summary: Dict[float, Dict[str, float]] = {}
+    for threshold in THRESHOLDS:
+        pred_binary = prediction >= threshold
+        gt_binary = ground_truth >= threshold
+        hits = float(np.sum(pred_binary & gt_binary))
+        false_alarms = float(np.sum(pred_binary & ~gt_binary))
+        misses = float(np.sum(~pred_binary & gt_binary))
+        denom = max(hits + false_alarms + misses, 1.0)
+        csi = hits / denom
+        pod = hits / max(hits + misses, 1.0)
+        far = false_alarms / max(hits + false_alarms, 1.0)
+        bias = (hits + false_alarms) / max(hits + misses, 1.0)
+        summary[threshold] = {
+            "csi": csi,
+            "pod": pod,
+            "far": far,
+            "bias": bias,
+            "tp": hits,
+            "fp": false_alarms,
+            "fn": misses,
+        }
+    return summary
+
+
+def _ensure_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _print_metrics(metrics: Dict[float, Dict[str, float]]) -> None:
+    print(f"\n{'Threshold':>10} {'CSI':>8} {'POD':>8} {'FAR':>8} {'Bias':>8} {'Hits':>10} {'FAs':>10}")
+    print("-" * 80)
+    for threshold in THRESHOLDS:
+        record = metrics[threshold]
+        print(
+            f"{int(threshold):>10} mm "
+            f"{record['csi']:>8.3f} {record['pod']:>8.3f} {record['far']:>8.3f} {record['bias']:>8.3f} "
+            f"{int(record['tp']):>10} {int(record['fp']):>10}"
         )
-        
-        best_idx_overall = np.argmax(overall_csi, axis=0)
-        best_overall = pd.DataFrame({
-            "obs_threshold": self.obs_thr,
-            "best_pred_threshold": self.pred_thr[best_idx_overall],
-            "CSI": overall_csi[best_idx_overall, np.arange(len(self.obs_thr))],
-            "POD": overall_pod[best_idx_overall, np.arange(len(self.obs_thr))],
-            "FAR": overall_far[best_idx_overall, np.arange(len(self.obs_thr))],
-            "Bias": overall_bias[best_idx_overall, np.arange(len(self.obs_thr))]
-        })
-        
-        results['overall'] = {
-            'best_metrics': best_overall.to_dict(orient='records'),
-            'csi_surface': overall_csi.tolist(),
-            'pod_surface': overall_pod.tolist(),
-            'far_surface': overall_far.tolist(),
-            'bias_surface': overall_bias.tolist()
-        }
-        
-        return results
 
-# ---------------- Evaluator ----------------
-class ModelEvaluator:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.s3 = boto3.client('s3')
-        self.loader = DataLoader(self.s3, cfg.DATA_CACHE_ROOT)
-        self.model = None
-        self.gmins = None
-        self.gmaxs = None
 
-        for d in (self.cfg.MODEL_CACHE_DIR, self.cfg.RESULTS_DIR):
-            os.makedirs(d, exist_ok=True)
+def run_verification(
+    target_dt: datetime,
+    lead_time: int,
+    builder: MRMSDataBuilder,
+    normalization: NormalizationArrays,
+    predictor: TiledPredictor,
+    output_dir: Path,
+    plot: bool,
+) -> PredictionSummary:
+    if lead_time % 5 != 0:
+        raise ValueError("Lead time must be a multiple of 5 minutes")
+    input_tensor = builder.build_input_tensor(target_dt, normalization)
+    prediction_sequence = predictor.predict(input_tensor)
 
-    def load_model(self) -> bool:
-        cache_path = os.path.join(self.cfg.MODEL_CACHE_DIR, f"{self.cfg.MODEL_NAME}.keras")
-        logger.info(f"Model cache path: {cache_path}")
-        try:
-            if not os.path.exists(cache_path):
-                logger.info(f"Downloading model: s3://{self.cfg.MODEL_BUCKET}/{self.cfg.MODEL_S3_PATH}")
-                self.s3.download_file(self.cfg.MODEL_BUCKET, self.cfg.MODEL_S3_PATH, cache_path)
+    lead_index = lead_time // 5 - 1
+    if lead_index < 0 or lead_index >= prediction_sequence.shape[0]:
+        raise ValueError(f"Lead time {lead_time} minutes is outside available range")
+    prediction = prediction_sequence[lead_index]
 
-            # Custom objects for model loading - MUST use actual classes from rnn.py and models.py
-            custom_objects = {
-                # Loss functions
-                'loss': weighted_mse(),
-                'weighted_mse': weighted_mse(),
-                'focal_mse': focal_mse(),
-                'combined_loss': combined_loss(),
-                'csi': csi,
-                # Helper functions
-                'reshape_and_stack': reshape_and_stack,
-                'slice_to_n_steps': slice_to_n_steps,
-                'slice_output_shape': slice_output_shape,
-                # Custom layers from rnn.py
-                'ResBlock': ResBlock,
-                'ConvBlock': ConvBlock,
-                'ZeroLikeLayer': ZeroLikeLayer,
-                'ReflectionPadding2D': ReflectionPadding2D,
-                'ConvGRU': ConvGRU,
-                'ResGRU': ResGRU,
-                'GRUResBlock': GRUResBlock,
-                # Learning rate scheduler
-                'WarmUpCosineDecayScheduler': WarmUpCosineDecayScheduler,
-            }
-            
-            # Load model with custom objects
-            self.model = tf.keras.models.load_model(cache_path, custom_objects=custom_objects, compile=False)
-            
-            # Log model info
-            logger.info(f"Loaded model: {self.cfg.MODEL_NAME}")
-            logger.info(f"  Input shape:  {self.model.input_shape}")
-            logger.info(f"  Output shape: {self.model.output_shape}")
-            logger.info(f"  Parameters:   {self.model.count_params():,}")
-            
-            return True
-        except Exception as e:
-            logger.error(f"Model load failed: {e}")
-            logger.error(f"Make sure rnn.py and models.py are in the same directory as this script")
-            return False
+    ground_truth_time = target_dt + timedelta(minutes=lead_time)
+    ground_truth = builder.build_ground_truth(ground_truth_time)
 
-    def load_norm(self) -> bool:
-        self.gmins = self.loader.load_numpy(self.cfg.MODEL_BUCKET, self.cfg.NORMALIZATION_MIN_PATH)
-        self.gmaxs = self.loader.load_numpy(self.cfg.MODEL_BUCKET, self.cfg.NORMALIZATION_MAX_PATH)
-        ok = self.gmins is not None and self.gmaxs is not None
-        if not ok:
-            logger.error("Normalization params not found.")
-        else:
-            logger.info(f"Loaded normalization params: mins shape={self.gmins.shape}, maxs shape={self.gmaxs.shape}")
-        return ok
+    metrics = compute_threshold_metrics(prediction, ground_truth)
+    _print_metrics(metrics)
+    print("\n" + "=" * 60)
+    print("SUMMARY STATISTICS")
+    print("=" * 60)
+    print(f"Prediction - Min: {prediction.min():.2f}, Max: {prediction.max():.2f}, Mean: {prediction.mean():.3f}")
+    print(f"Ground Truth - Min: {ground_truth.min():.2f}, Max: {ground_truth.max():.2f}, Mean: {ground_truth.mean():.3f}")
+    print(f"Non-zero pixels - Prediction: {(prediction > 0).sum()}, Ground Truth: {(ground_truth > 0).sum()}")
 
-    @staticmethod
-    def _resolve_paths_from_row(row: pd.Series) -> Optional[Tuple[str, str]]:
-        """Resolve input and target paths from dataframe row"""
-        target_key = None
-        for cand in ('target_path', 'target', 'y_path'):
-            if cand in row and isinstance(row[cand], str) and row[cand].strip():
-                target_key = row[cand].strip()
-                break
+    plot_path: Optional[str] = None
+    if plot:
+        _ensure_directory(output_dir)
+        filename = f"verify_{target_dt.strftime('%Y%m%d_%H%M')}_lead{lead_time:03d}.png"
+        plot_path = plot_ground_truth_prediction_difference(
+            ground_truth=ground_truth,
+            prediction=prediction,
+            title=f"{target_dt.isoformat()} (+{lead_time}m)",
+            output_dir=str(output_dir),
+            filename=filename,
+        )
+        if plot_path:
+            logging.getLogger(__name__).info("Wrote comparison plot to %s", plot_path)
 
-        input_key = None
-        for cand in ('file_path', 'input_path', 'inputs_path', 'x_path'):
-            if cand in row and isinstance(row[cand], str) and row[cand].strip():
-                input_key = row[cand].strip()
-                break
+    return PredictionSummary(prediction=prediction, ground_truth=ground_truth, metrics=metrics, plot_path=plot_path)
 
-        if input_key is None and target_key is None:
-            return None
 
-        if target_key is None and input_key is not None:
-            # Try to infer target path from input path
-            if "/input/" in input_key:
-                target_key = input_key.replace("/input/", "/mesh_swath_intervals/")
-            elif "input/" in input_key:
-                target_key = input_key.replace("input/", "mesh_swath_intervals/")
-            else:
-                if "input" in input_key:
-                    suffix = input_key.split("input", 1)[1]
-                    target_key = f"data/int5/mesh_swath_intervals{suffix}"
-                else:
-                    base = os.path.basename(input_key)
-                    target_key = input_key.replace(base, f"mesh_swath_intervals_{base}")
-        
-        return input_key, target_key
+def save_outputs(summary: PredictionSummary, target_dt: datetime, lead_time: int, output_dir: Path) -> None:
+    _ensure_directory(output_dir)
+    prefix = output_dir / f"verify_{target_dt.strftime('%Y%m%d_%H%M')}_lead{lead_time:03d}"
+    np.save(f"{prefix}_prediction.npy", summary.prediction)
+    np.save(f"{prefix}_ground_truth.npy", summary.ground_truth)
+    with open(f"{prefix}_metrics.json", "w", encoding="utf-8") as handle:
+        json.dump({"thresholds": summary.metrics}, handle, indent=2)
+    logging.getLogger(__name__).info("Saved outputs to %s", prefix)
 
-    def extract_60min_swath(self, target_array: np.ndarray) -> np.ndarray:
-        """
-        Extract 60-minute MESH swath from target array.
-        The 60-minute swath is typically in channel 0 of the target.
-        """
-        if target_array.ndim == 4:
-            # Shape: (T, H, W, C) - take channel 0 at any timestep (they should be the same)
-            return target_array[0, :, :, 0]
-        elif target_array.ndim == 3:
-            # Shape: (T, H, W) or (H, W, C)
-            if target_array.shape[0] == 12:  # Likely (T, H, W)
-                return target_array[0, :, :]
-            else:  # Likely (H, W, C)
-                return target_array[:, :, 0]
-        elif target_array.ndim == 2:
-            # Already 2D
-            return target_array
-        else:
-            logger.warning(f"Unexpected target shape: {target_array.shape}")
-            return target_array.squeeze()[:, :, 0] if target_array.shape[-1] > 1 else target_array.squeeze()
 
-    def evaluate(self) -> Dict:
-        df = self.loader.load_csv(self.cfg.TEST_DF_BUCKET, self.cfg.TEST_DF_PATH)
-        if df is None or df.empty:
-            logger.error("Empty test dataframe.")
-            return {}
-        
-        # Sample if needed
-        if len(df) > self.cfg.NUM_SAMPLES:
-            df = df.sample(self.cfg.NUM_SAMPLES, random_state=42)
-            logger.info(f"Sampled {self.cfg.NUM_SAMPLES} from {len(df)} total samples")
-        
-        logger.info(f"Evaluating {len(df)} samples against 60-minute MESH swath")
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
 
-        # Setup metrics calculator
-        pred_cuts = np.arange(self.cfg.PRED_CUTOFF_MIN, self.cfg.PRED_CUTOFF_MAX + 1e-9, self.cfg.PRED_CUTOFF_STEP)
-        obs_thrs = np.array(self.cfg.OBS_THRESHOLDS, dtype=float)
-        
-        metrics_calc = MetricsCalculator(pred_cuts, obs_thrs)
-        
-        # Track statistics
-        successful_samples = 0
-        failed_samples = 0
-        prediction_stats = []
-        target_stats = []
-        
-        # Main evaluation loop
-        for i, (idx, row) in enumerate(df.iterrows(), start=1):
-            if i % 20 == 0:
-                logger.info(f"Progress: {i}/{len(df)} samples")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
 
-            resolved = self._resolve_paths_from_row(row)
-            if not resolved:
-                logger.warning(f"Row {idx}: could not resolve paths")
-                failed_samples += 1
-                continue
-            input_key, target_key = resolved
+    datetimes = [_parse_datetime(value) for value in args.datetimes]
+    loader = S3ArtifactLoader(cache_dir=args.cache_dir)
+    normalization = load_normalization_arrays(loader, args.model_bucket, args.norm_min_key, args.norm_max_key)
 
-            # Load data
-            x = self.loader.load_numpy(self.cfg.MODEL_BUCKET, input_key)
-            y = self.loader.load_numpy(self.cfg.MODEL_BUCKET, target_key)
-            if x is None or y is None:
-                logger.warning(f"Row {idx}: missing arrays")
-                failed_samples += 1
-                continue
+    mrms_config = MRMSConfig(
+        bucket=args.mrms_bucket,
+        tile_size=args.tile_size,
+        stride=args.stride,
+    )
+    builder = MRMSDataBuilder(mrms_config)
 
-            # Extract 60-minute swath from target
-            target_60min = self.extract_60min_swath(y)
-            
-            # Process input
-            if x.ndim < 4:
-                x = np.expand_dims(x, -1)
-            x = x[::-1, :, :, :]  # reverse time
-            x = x[self.cfg.TIMESTEPS][:, :, :, self.cfg.CHANNELS]
-            
-            # Normalize inputs
-            x = self.loader.normalize_inputs(x, self.gmins, self.gmaxs)
-            x[np.isnan(x)] = 0.0
-            target_60min[np.isnan(target_60min)] = 0.0
+    config = StandaloneConfig(
+        model_path=args.model_path,
+        model_type=args.model_type,
+        flow_steps=args.flow_steps,
+    )
+    loaded = ModelLoader().load(config)
+    predictor = TiledPredictor(
+        loaded.model,
+        loaded.model_type,
+        tile_size=args.tile_size,
+        stride=args.stride,
+        flow_steps=args.flow_steps,
+    )
 
-            # Predict
-            try:
-                pred = self.model.predict(np.expand_dims(x, 0), verbose=0)  # (1, 12, H, W, 1)
-                pred = pred[0]  # (12, H, W, 1)
-                successful_samples += 1
-            except Exception as e:
-                logger.error(f"Prediction failed for sample {idx}: {e}")
-                failed_samples += 1
-                continue
+    output_dir = Path(args.output_dir)
+    for dt in datetimes:
+        logging.info("=" * 80)
+        logging.info("MESH FORECAST VERIFICATION FOR %s", dt.isoformat())
+        logging.info("Lead time: %d minutes", args.lead_time)
+        summary = run_verification(
+            dt,
+            args.lead_time,
+            builder,
+            normalization,
+            predictor,
+            output_dir,
+            plot=not args.no_plots,
+        )
+        if args.save_outputs:
+            save_outputs(summary, dt, args.lead_time, output_dir)
 
-            # Update metrics
-            metrics_calc.update(pred, target_60min)
-            
-            # Collect statistics
-            prediction_stats.append({
-                'min': float(np.min(pred)),
-                'max': float(np.max(pred)),
-                'mean': float(np.mean(pred)),
-                'std': float(np.std(pred))
-            })
-            target_stats.append({
-                'min': float(np.min(target_60min)),
-                'max': float(np.max(target_60min)),
-                'mean': float(np.mean(target_60min)),
-                'std': float(np.std(target_60min))
-            })
+    print("\n" + "=" * 60)
+    print("SUGGESTED TEST DATES:")
+    print("-" * 60)
+    for suggestion in SUGGESTED_DATES:
+        print(f"  python {Path(__file__).name} --datetime {suggestion} --model_path {args.model_path}")
+    print("=" * 60)
 
-        logger.info(f"Evaluation complete: {successful_samples} successful, {failed_samples} failed")
-
-        # Finalize metrics
-        metrics_results = metrics_calc.finalize()
-        
-        # Compute aggregate statistics
-        if prediction_stats:
-            agg_pred_stats = {
-                'min': float(np.mean([s['min'] for s in prediction_stats])),
-                'max': float(np.mean([s['max'] for s in prediction_stats])),
-                'mean': float(np.mean([s['mean'] for s in prediction_stats])),
-                'std': float(np.mean([s['std'] for s in prediction_stats]))
-            }
-        else:
-            agg_pred_stats = {'min': 0, 'max': 0, 'mean': 0, 'std': 0}
-        
-        if target_stats:
-            agg_target_stats = {
-                'min': float(np.mean([s['min'] for s in target_stats])),
-                'max': float(np.mean([s['max'] for s in target_stats])),
-                'mean': float(np.mean([s['mean'] for s in target_stats])),
-                'std': float(np.mean([s['std'] for s in target_stats]))
-            }
-        else:
-            agg_target_stats = {'min': 0, 'max': 0, 'mean': 0, 'std': 0}
-        
-        # Create final results
-        final_results = {
-            'model': self.cfg.MODEL_NAME,
-            'evaluation_datetime': datetime.utcnow().isoformat(),
-            'num_samples': len(df),
-            'successful_samples': successful_samples,
-            'failed_samples': failed_samples,
-            'target': '60-minute MESH swath',
-            'prediction_statistics': agg_pred_stats,
-            'target_statistics': agg_target_stats,
-            'metrics_by_timestep': metrics_results,
-            'observation_thresholds': self.cfg.OBS_THRESHOLDS,
-            'prediction_threshold_range': {
-                'min': self.cfg.PRED_CUTOFF_MIN,
-                'max': self.cfg.PRED_CUTOFF_MAX,
-                'step': self.cfg.PRED_CUTOFF_STEP
-            }
-        }
-        
-        # Print summary
-        self._print_summary(metrics_results)
-        
-        return final_results
-
-    def _print_summary(self, metrics_results):
-        """Print evaluation summary"""
-        logger.info("\n" + "="*80)
-        logger.info("EVALUATION SUMMARY - 60-MINUTE MESH SWATH")
-        logger.info("="*80)
-        
-        # Print overall metrics
-        overall = metrics_results['overall']['best_metrics']
-        logger.info("\nOVERALL METRICS (averaged across all timesteps):")
-        logger.info(f"{'Obs Thr':>8} {'Best Pred':>10} {'CSI':>8} {'POD':>8} {'FAR':>8} {'Bias':>8}")
-        logger.info("-" * 60)
-        for metric in overall:
-            logger.info(f"{metric['obs_threshold']:>7.0f}mm {metric['best_pred_threshold']:>9.1f}mm "
-                       f"{metric['CSI']:>8.3f} {metric['POD']:>8.3f} {metric['FAR']:>8.3f} {metric['Bias']:>8.2f}")
-        
-        # Print metrics for key timesteps
-        key_timesteps = [0, 6, 11]  # 0, 30, and 55 minutes
-        for t in key_timesteps:
-            timestep_key = f'timestep_{t}'
-            if timestep_key in metrics_results:
-                minutes = metrics_results[timestep_key]['minutes']
-                metrics = metrics_results[timestep_key]['best_metrics']
-                
-                logger.info(f"\nTIMESTEP {t} ({minutes} minutes) METRICS:")
-                logger.info(f"{'Obs Thr':>8} {'Best Pred':>10} {'CSI':>8} {'POD':>8} {'FAR':>8} {'Bias':>8}")
-                logger.info("-" * 60)
-                for metric in metrics:
-                    logger.info(f"{metric['obs_threshold']:>7.0f}mm {metric['best_pred_threshold']:>9.1f}mm "
-                               f"{metric['CSI']:>8.3f} {metric['POD']:>8.3f} {metric['FAR']:>8.3f} {metric['Bias']:>8.2f}")
-
-# ---------------- Main ----------------
-def main():
-    cfg = Config()
-    logger.info("="*80)
-    logger.info("EVALUATE MESH MODEL - 60-MINUTE SWATH TARGET")
-    logger.info("="*80)
-    logger.info(f"Model:     {cfg.MODEL_NAME}")
-    logger.info(f"Model S3:  s3://{cfg.MODEL_BUCKET}/{cfg.MODEL_S3_PATH}")
-    logger.info(f"Test CSV:  s3://{cfg.TEST_DF_BUCKET}/{cfg.TEST_DF_PATH}")
-    logger.info(f"Samples:   {cfg.NUM_SAMPLES}")
-    logger.info(f"Target:    60-minute MESH swath")
-    logger.info(f"Results dir: {cfg.RESULTS_DIR}")
-    logger.info("="*80)
-
-    # Create directories
-    for d in (cfg.MODEL_CACHE_DIR, cfg.RESULTS_DIR, cfg.DATA_CACHE_ROOT):
-        os.makedirs(d, exist_ok=True)
-
-    # Initialize evaluator
-    ev = ModelEvaluator(cfg)
-    
-    # Load model and normalization
-    if not ev.load_model(): 
-        logger.error("Failed to load model")
-        return
-    if not ev.load_norm():  
-        logger.error("Failed to load normalization parameters")
-        return
-
-    # Run evaluation
-    results = ev.evaluate()
-    if not results:
-        logger.error("No results produced.")
-        return
-
-    # Save results
-    os.makedirs(cfg.RESULTS_DIR, exist_ok=True)
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    out_json = os.path.join(cfg.RESULTS_DIR, f"results_60min_swath_{ts}.json")
-    with open(out_json, "w") as f:
-        json.dump(results, f, indent=2)
-    logger.info(f"\nResults saved to: {out_json}")
-
-    # Save summary CSV for easy viewing
-    if 'overall' in results.get('metrics_by_timestep', {}):
-        overall_df = pd.DataFrame(results['metrics_by_timestep']['overall']['best_metrics'])
-        csv_path = os.path.join(cfg.RESULTS_DIR, f"overall_metrics_{ts}.csv")
-        overall_df.to_csv(csv_path, index=False)
-        logger.info(f"Overall metrics CSV saved to: {csv_path}")
 
 if __name__ == "__main__":
     main()
+
