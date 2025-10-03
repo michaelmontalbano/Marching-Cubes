@@ -117,7 +117,7 @@ class MeshEvaluator:
             if self.config.save_summary:
                 plot_path = plot_ground_truth_prediction_difference(
                     ground_truth=target_swath,
-                    prediction=np.squeeze(prediction.final_frame),
+                    prediction=np.squeeze(prediction.final_frame[-1]),
                     title=f"Mesh Eval Tile {idx}",
                     output_dir=self.config.summary_dir,
                     filename=f"mesh_tile_{idx:05d}.png",

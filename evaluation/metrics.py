@@ -37,6 +37,8 @@ class CSIMetricsCalculator:
 
     def update(self, predictions: np.ndarray, target: np.ndarray) -> None:
         target_flat = target.reshape(-1)
+        print(target_flat.shape)
+        predictions = predictions[0]
         for t in range(predictions.shape[0]):
             pred_flat = predictions[t].reshape(-1)
             for p_idx, pred_thr in enumerate(self.pred_thresholds):
