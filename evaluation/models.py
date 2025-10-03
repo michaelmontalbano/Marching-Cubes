@@ -161,6 +161,58 @@ def _rebuild_and_load_flow_h5_weights(h5_path: str) -> tfk.Model:
     return model
 
 
+# --- ConvGRU legacy rebuild -----------------------------------------------
+def _build_convgru_architecture(
+    *,
+    timesteps: int = 12,
+    height: int = 256,
+    width: int = 256,
+    channels: int = 8,
+    initial_filters: int = 16,
+    kernel_size: int = 3,
+    num_downsampling: int = 3,
+    dropout_rate: float = 0.27,
+) -> tfk.Model:
+    """Recreate the historic ConvGRU architecture used for legacy checkpoints."""
+
+    from rnn import rnn as build_rnn  # Imported lazily to avoid heavy dependencies
+
+    future_channels = max(0, channels - 1)
+    other_fields_shape = (timesteps, height, width, future_channels)
+    model = build_rnn(
+        timesteps=timesteps,
+        height=height,
+        width=width,
+        channels=channels,
+        other_fields_shape=other_fields_shape,
+        initial_filters=initial_filters,
+        final_activation="linear",
+        dropout_rate=dropout_rate,
+        l1_reg=0.28,
+        l2_reg=0.29,
+        x_pad=0,
+        y_pad=0,
+        kernel_size=kernel_size,
+        padding="same",
+        num_downsampling=num_downsampling,
+        future_channels=future_channels,
+    )
+    return model
+
+
+def _rebuild_and_load_convgru_h5_weights(h5_path: str) -> tfk.Model:
+    """Recreate ConvGRU graph and load weights from a legacy H5 checkpoint."""
+
+    model = _build_convgru_architecture()
+    try:
+        model.load_weights(h5_path, skip_mismatch=False)
+        logger.info("Loaded weights from %s into rebuilt ConvGRU model.", h5_path)
+    except Exception as exc:  # pragma: no cover - exercised only with legacy checkpoints
+        logger.error("Failed to load ConvGRU weights from %s: %s", h5_path, exc)
+        raise
+    return model
+
+
 # --- Optional: convgru custom objects (kept; not used for FLOW rebuild path) --
 def _convgru_custom_objects() -> Dict[str, object]:
     try:
@@ -238,15 +290,42 @@ class ModelLoader:
 
         # Otherwise, try normal Keras 3 load (works for .keras zip or SavedModel dir)
         custom_objects = _custom_objects_for(model_type)
-        model = self._load_with_fallbacks(model_path, custom_objects)
+        model = self._load_with_fallbacks(model_path, custom_objects, model_type)
         logger.info("Loaded %s model from %s", model_type.value, model_path)
         return LoadedModel(model=model, model_type=model_type)
 
     @staticmethod
-    def _load_with_fallbacks(path: str, custom_objects: Dict[str, object]) -> tfk.Model:
+    def _load_with_fallbacks(
+        path: str,
+        custom_objects: Dict[str, object],
+        model_type: ModelType,
+    ) -> tfk.Model:
+        def _attempt_load(load_path: str) -> tfk.Model:
+            try:
+                return tfk.models.load_model(
+                    load_path,
+                    custom_objects=custom_objects,
+                    compile=False,
+                    safe_mode=False,
+                )
+            except TypeError as exc:
+                message = str(exc)
+                if (
+                    "ellipsis" in message.lower()
+                    and model_type is ModelType.CONVGRU
+                    and h5py is not None
+                    and h5py.is_hdf5(load_path)
+                ):
+                    logger.info(
+                        "Detected ellipsis objects in legacy ConvGRU checkpoint; "
+                        "rebuilding architecture and loading weights manually."
+                    )
+                    return _rebuild_and_load_convgru_h5_weights(load_path)
+                raise
+
         try:
             # Allow legacy graphs & custom objects
-            return tfk.models.load_model(path, custom_objects=custom_objects, compile=False, safe_mode=False)
+            return _attempt_load(path)
         except ValueError as exc:
             message = str(exc)
             # Handle legacy .h5 saved with .keras suffix
@@ -256,7 +335,7 @@ class ModelLoader:
                     temp_path = tmp.name
                 try:
                     shutil.copy2(path, temp_path)
-                    return tfk.models.load_model(temp_path, custom_objects=custom_objects, compile=False, safe_mode=False)
+                    return _attempt_load(temp_path)
                 finally:
                     try:
                         os.remove(temp_path)
