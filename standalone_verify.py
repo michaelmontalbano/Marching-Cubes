@@ -118,10 +118,16 @@ def load_normalization_arrays(
 
 
 @dataclass
+class ThresholdResults:
+    per_threshold: Dict[float, Dict[str, float]]
+    best_by_observation: List[Dict[str, float]]
+
+
+@dataclass
 class PredictionSummary:
     prediction: np.ndarray
     ground_truth: np.ndarray
-    metrics: Dict[float, Dict[str, float]]
+    metrics: ThresholdResults
     plot_path: Optional[str]
 
 
@@ -209,44 +215,86 @@ class TiledPredictor:
         return np.stack(frames, axis=0)
 
 
-def compute_threshold_metrics(prediction: np.ndarray, ground_truth: np.ndarray) -> Dict[float, Dict[str, float]]:
-    summary: Dict[float, Dict[str, float]] = {}
-    for threshold in THRESHOLDS:
-        pred_binary = prediction >= threshold
-        gt_binary = ground_truth >= threshold
-        hits = float(np.sum(pred_binary & gt_binary))
-        false_alarms = float(np.sum(pred_binary & ~gt_binary))
-        misses = float(np.sum(~pred_binary & gt_binary))
-        denom = max(hits + false_alarms + misses, 1.0)
-        csi = hits / denom
-        pod = hits / max(hits + misses, 1.0)
-        far = false_alarms / max(hits + false_alarms, 1.0)
-        bias = (hits + false_alarms) / max(hits + misses, 1.0)
-        summary[threshold] = {
-            "csi": csi,
-            "pod": pod,
-            "far": far,
-            "bias": bias,
-            "tp": hits,
-            "fp": false_alarms,
-            "fn": misses,
+def compute_threshold_metrics(prediction: np.ndarray, ground_truth: np.ndarray) -> ThresholdResults:
+    num_thresholds = len(THRESHOLDS)
+    tp_surface = np.zeros((num_thresholds, num_thresholds), dtype=np.float64)
+    fp_surface = np.zeros_like(tp_surface)
+    fn_surface = np.zeros_like(tp_surface)
+
+    pred_masks = [prediction >= thr for thr in THRESHOLDS]
+    obs_masks = [ground_truth >= thr for thr in THRESHOLDS]
+
+    for p_idx, pred_mask in enumerate(pred_masks):
+        inv_pred_mask = ~pred_mask
+        for o_idx, obs_mask in enumerate(obs_masks):
+            hits = float(np.sum(pred_mask & obs_mask))
+            false_alarms = float(np.sum(pred_mask & ~obs_mask))
+            misses = float(np.sum(inv_pred_mask & obs_mask))
+            tp_surface[p_idx, o_idx] = hits
+            fp_surface[p_idx, o_idx] = false_alarms
+            fn_surface[p_idx, o_idx] = misses
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        denom = tp_surface + fp_surface + fn_surface
+        csi_surface = np.where(denom > 0.0, tp_surface / denom, 0.0)
+        pod_surface = np.where((tp_surface + fn_surface) > 0.0, tp_surface / (tp_surface + fn_surface), 0.0)
+        far_surface = np.where((tp_surface + fp_surface) > 0.0, fp_surface / (tp_surface + fp_surface), 0.0)
+        bias_surface = np.where((tp_surface + fn_surface) > 0.0, (tp_surface + fp_surface) / (tp_surface + fn_surface), 0.0)
+
+    per_threshold: Dict[float, Dict[str, float]] = {}
+    for idx, threshold in enumerate(THRESHOLDS):
+        per_threshold[threshold] = {
+            "csi": float(csi_surface[idx, idx]),
+            "pod": float(pod_surface[idx, idx]),
+            "far": float(far_surface[idx, idx]),
+            "bias": float(bias_surface[idx, idx]),
+            "tp": float(tp_surface[idx, idx]),
+            "fp": float(fp_surface[idx, idx]),
+            "fn": float(fn_surface[idx, idx]),
         }
-    return summary
+
+    best_by_observation: List[Dict[str, float]] = []
+    for o_idx, obs_threshold in enumerate(THRESHOLDS):
+        best_pred_idx = int(np.argmax(csi_surface[:, o_idx]))
+        best_by_observation.append(
+            {
+                "obs_threshold": float(obs_threshold),
+                "best_pred_threshold": float(THRESHOLDS[best_pred_idx]),
+                "csi": float(csi_surface[best_pred_idx, o_idx]),
+                "pod": float(pod_surface[best_pred_idx, o_idx]),
+                "far": float(far_surface[best_pred_idx, o_idx]),
+                "bias": float(bias_surface[best_pred_idx, o_idx]),
+                "tp": float(tp_surface[best_pred_idx, o_idx]),
+                "fp": float(fp_surface[best_pred_idx, o_idx]),
+                "fn": float(fn_surface[best_pred_idx, o_idx]),
+            }
+        )
+
+    return ThresholdResults(per_threshold=per_threshold, best_by_observation=best_by_observation)
 
 
 def _ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def _print_metrics(metrics: Dict[float, Dict[str, float]]) -> None:
+def _print_metrics(metrics: ThresholdResults) -> None:
     print(f"\n{'Threshold':>10} {'CSI':>8} {'POD':>8} {'FAR':>8} {'Bias':>8} {'Hits':>10} {'FAs':>10}")
     print("-" * 80)
     for threshold in THRESHOLDS:
-        record = metrics[threshold]
+        record = metrics.per_threshold[threshold]
         print(
             f"{int(threshold):>10} mm "
             f"{record['csi']:>8.3f} {record['pod']:>8.3f} {record['far']:>8.3f} {record['bias']:>8.3f} "
             f"{int(record['tp']):>10} {int(record['fp']):>10}"
+        )
+
+    print(f"\n{'Obs Thr':>10} {'Best Pred':>12} {'CSI':>8} {'POD':>8} {'FAR':>8} {'Bias':>8}")
+    print("-" * 80)
+    for record in metrics.best_by_observation:
+        print(
+            f"{int(record['obs_threshold']):>10} mm "
+            f"{int(record['best_pred_threshold']):>12} mm "
+            f"{record['csi']:>8.3f} {record['pod']:>8.3f} {record['far']:>8.3f} {record['bias']:>8.3f}"
         )
 
 
@@ -304,7 +352,14 @@ def save_outputs(summary: PredictionSummary, target_dt: datetime, lead_time: int
     np.save(f"{prefix}_prediction.npy", summary.prediction)
     np.save(f"{prefix}_ground_truth.npy", summary.ground_truth)
     with open(f"{prefix}_metrics.json", "w", encoding="utf-8") as handle:
-        json.dump({"thresholds": summary.metrics}, handle, indent=2)
+        json.dump(
+            {
+                "thresholds": summary.metrics.per_threshold,
+                "best_thresholds": summary.metrics.best_by_observation,
+            },
+            handle,
+            indent=2,
+        )
     logging.getLogger(__name__).info("Saved outputs to %s", prefix)
 
 
