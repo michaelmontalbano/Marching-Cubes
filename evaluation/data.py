@@ -151,7 +151,7 @@ class EvaluationDataRepository:
         cols = []
         for col in df.columns:
             lower = col.lower()
-            if "date" in lower or "time" in lower:
+            if "date" in lower or "time" in lower or "datetime" in lower:
                 cols.append(col)
         return cols
 
@@ -163,12 +163,74 @@ class EvaluationDataRepository:
             if not value:
                 continue
             raw = value.strip()
+            if not raw:
+                continue
             raw_strings.append(raw)
             try:
                 normalized.append(pd.to_datetime(raw, utc=True))
             except Exception:
                 logger.warning("Failed to parse datetime filter '%s'", raw)
         return normalized, raw_strings
+
+    @staticmethod
+    def _expanded_datetime_strings(
+        normalized: Sequence[pd.Timestamp], raw_strings: Sequence[str]
+    ) -> set:
+        expanded: set = set()
+        for ts in normalized:
+            try:
+                iso = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+                compact = ts.strftime("%Y%m%d%H%M%S")
+                expanded.update({iso, iso.replace("T", " "), compact})
+                expanded.add(compact[:8])
+                expanded.add(compact[8:])
+            except Exception:
+                continue
+        for raw in raw_strings:
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            expanded.add(stripped)
+            expanded.add(stripped.replace("Z", ""))
+            expanded.add(stripped.replace("-", "").replace(":", "").replace("T", ""))
+            expanded.add(stripped.replace(":", "").replace("T", " "))
+        return {s for s in expanded if s}
+
+    @staticmethod
+    def _normalize_date_component(value: object) -> str:
+        if pd.isna(value):
+            return ""
+        text = str(value).strip()
+        if not text:
+            return ""
+        text = text.replace("-", "").replace("/", "")
+        try:
+            if text.isdigit():
+                return text.zfill(8)
+            parsed = pd.to_datetime(text, utc=True, errors="coerce")
+            if pd.isna(parsed):
+                return ""
+            return parsed.strftime("%Y%m%d")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _normalize_time_component(value: object) -> str:
+        if pd.isna(value):
+            return ""
+        text = str(value).strip()
+        if not text:
+            return ""
+        text = text.replace(":", "")
+        try:
+            if text.isdigit():
+                return text.zfill(6)
+            parsed = pd.to_datetime(text, utc=True, errors="coerce")
+            if pd.isna(parsed):
+                return ""
+            return parsed.strftime("%H%M%S")
+        except Exception:
+            return ""
 
     def filter_by_datetimes(self, df: pd.DataFrame, datetimes: Sequence[str]) -> pd.DataFrame:
         if not datetimes:
@@ -177,17 +239,55 @@ class EvaluationDataRepository:
         if not normalized and not raw_strings:
             return df
         candidates = self._candidate_datetime_columns(df)
-        if not candidates:
+        column_lookup = {col.lower(): col for col in df.columns}
+        date_col = column_lookup.get("date")
+        time_col = column_lookup.get("timestamp")
+        if not candidates and (not date_col or not time_col):
             logger.warning("Datetime filters provided but dataframe lacks datetime-like columns")
             return df.iloc[0:0]
-        mask = pd.Series(False, index=df.index)
+        expanded_strings = self._expanded_datetime_strings(normalized, raw_strings)
+        mask = pd.Series(False, index=df.index, dtype=bool)
         for column in candidates:
             series = df[column]
             parsed = pd.to_datetime(series, utc=True, errors="coerce")
             if normalized:
                 mask |= parsed.isin(normalized)
-            if raw_strings:
-                mask |= series.astype(str).str.strip().isin(raw_strings)
+            if expanded_strings:
+                mask |= series.astype(str).str.strip().isin(expanded_strings)
+        if date_col and time_col:
+            date_strings = df[date_col].apply(self._normalize_date_component)
+            time_strings = df[time_col].apply(self._normalize_time_component)
+            valid_components = (date_strings.str.len() == 8) & (time_strings.str.len() == 6)
+            combined_compact = pd.Series("", index=df.index, dtype=object)
+            combined_iso = pd.Series("", index=df.index, dtype=object)
+            combined_compact.loc[valid_components] = (
+                date_strings.loc[valid_components] + time_strings.loc[valid_components]
+            )
+            combined_iso.loc[valid_components] = (
+                date_strings.loc[valid_components].str.slice(0, 4)
+                + "-"
+                + date_strings.loc[valid_components].str.slice(4, 6)
+                + "-"
+                + date_strings.loc[valid_components].str.slice(6, 8)
+                + "T"
+                + time_strings.loc[valid_components].str.slice(0, 2)
+                + ":"
+                + time_strings.loc[valid_components].str.slice(2, 4)
+                + ":"
+                + time_strings.loc[valid_components].str.slice(4, 6)
+                + "Z"
+            )
+            parsed_combo = pd.to_datetime(
+                combined_compact.where(valid_components),
+                format="%Y%m%d%H%M%S",
+                errors="coerce",
+                utc=True,
+            )
+            if normalized:
+                mask |= parsed_combo.isin(normalized)
+            if expanded_strings:
+                mask |= combined_compact.isin(expanded_strings)
+                mask |= combined_iso.isin(expanded_strings)
         filtered = df[mask]
         logger.info("Datetime filter reduced rows from %d to %d", len(df), len(filtered))
         return filtered
@@ -197,7 +297,12 @@ class EvaluationDataRepository:
         if datetimes:
             df = self.filter_by_datetimes(df, datetimes)
         if df.empty:
-            raise RuntimeError("No samples match the provided filters")
+            if datetimes:
+                raise RuntimeError(
+                    "No samples match the provided datetime filters: "
+                    + ", ".join(datetimes)
+                )
+            raise RuntimeError("No samples available for evaluation")
         if n_tiles is not None and n_tiles > 0:
             df = df.head(n_tiles)
         return df.reset_index(drop=True)
