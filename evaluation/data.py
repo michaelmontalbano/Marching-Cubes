@@ -14,7 +14,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # Channels to min/max normalize (mask channel index 7 excluded)
-DEFAULT_NORMALIZED_CHANNELS: Tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6)
+DEFAULT_NORMALIZED_CHANNELS: Tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7)
 
 
 class S3ArtifactLoader:
@@ -103,6 +103,7 @@ class NormalizationBundle:
         if sample.ndim != 4:
             raise ValueError(f"Expected input with shape (T, H, W, C); got {sample.shape}")
         normalized = np.zeros_like(sample, dtype=np.float32)
+        print(sample.shape)
         for c in range(sample.shape[-1]):
             channel_slice = sample[..., c]
             if c in self.normalized_channels:

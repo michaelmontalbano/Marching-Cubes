@@ -178,34 +178,75 @@ class MRMSDataBuilder:
             return after[1]
         return before[1]
 
-    def _load_grib_dataset(self, key: str) -> Optional[xr.Dataset]:
+    def _load_grib_dataset(self, key: str) -> tuple[Optional[xr.Dataset], Optional[str], Optional[str]]:
+        """
+        Download and decompress a GRIB2 .gz to /tmp, open with cfgrib, and return:
+        (dataset, gz_path, grib_path)
+
+        NOTE: The caller is responsible for closing the dataset and deleting paths.
+        """
         tmp_base = os.path.join("/tmp", os.path.basename(key))
         gz_path = tmp_base
         grib_path = tmp_base[:-3] if gz_path.endswith(".gz") else f"{tmp_base}.grib2"
         try:
+            # Download .gz
             with open(gz_path, "wb") as handle:
                 obj = self._anon_client.get_object(Bucket=self.config.bucket, Key=key)
                 handle.write(obj["Body"].read())
+
+            # Decompress to .grib2
             with gzip.open(gz_path, "rb") as zipped, open(grib_path, "wb") as out:
                 shutil.copyfileobj(zipped, out)
-            ds = xr.open_dataset(grib_path, engine="cfgrib")
-            return ds
+
+            # Open with cfgrib; keep index in-memory to avoid .idx files
+            ds = xr.open_dataset(
+                grib_path,
+                engine="cfgrib",
+                backend_kwargs={"indexpath": ""},  # no on-disk index
+            )
+            return ds, gz_path, grib_path
+
         except Exception as exc:
             logger.error("Error loading MRMS file %s: %s", key, exc)
-            return None
-        finally:
+            # Best-effort cleanup if we failed early
             for path in (gz_path, grib_path):
                 try:
-                    if os.path.exists(path):
+                    if path and os.path.exists(path):
                         os.remove(path)
                 except OSError:
                     pass
+            return None, None, None
+
 
     def _extract_array(self, dataset: xr.Dataset) -> Optional[np.ndarray]:
-        try:
-            values = dataset["unknown"].values
-        except Exception:
+        data_var: Optional[xr.DataArray] = None
+        # Prefer explicitly named fields but gracefully fall back to the first
+        # available data variable.  Recent MRMS files occasionally expose the
+        # field under different names (e.g. ``hail_size``) instead of the
+        # historical ``unknown`` key that older archives used.
+        preferred_names = ("unknown","MESH","MESHMax60min","MaximumEstimatedHailSize","hail_size",)
+
+        for name in preferred_names:
+            if name in dataset:
+                data_var = dataset[name]
+                break
+
+        if data_var is None:
+            try:
+                first_name = next(iter(dataset.data_vars))
+            except StopIteration:
+                return None
+            logging.getLogger(__name__).debug(
+                "Falling back to first data variable '%s' in MRMS dataset", first_name
+            )
+            data_var = dataset[first_name]
+
+        values = np.asarray(np.ma.getdata(data_var.values))
+        if values.ndim > 2:
+            values = np.squeeze(values)
+        if values.ndim != 2:
             return None
+
         array = np.flipud(values)
         if array.shape == (self.config.target_width, self.config.target_height):
             array = zoom(array, zoom=0.5, order=2)
@@ -301,25 +342,35 @@ class MRMSDataBuilder:
         logger.error("No MESH data available for %s", target_dt.isoformat())
         return np.zeros((self.config.target_height, self.config.target_width), dtype=np.float32)
 
-    # ------------------------------------------------------------------
-    # Helpers
     def _load_mesh_field(self, key: Optional[str]) -> np.ndarray:
         if key is None:
             return np.zeros((self.config.target_height, self.config.target_width), dtype=np.float32)
-        dataset = self._load_grib_dataset(key)
-        if dataset is None:
+
+        ds, gz_path, grib_path = self._load_grib_dataset(key)
+        if ds is None:
             return np.zeros((self.config.target_height, self.config.target_width), dtype=np.float32)
+
         try:
-            array = self._extract_array(dataset)
+            array = self._extract_array(ds)
         finally:
+            # Close dataset before deleting the files it still references
             try:
-                dataset.close()
+                ds.close()
             except Exception:
                 pass
+            # Now safe to delete temp files
+            for path in (gz_path, grib_path):
+                try:
+                    if path and os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+
         if array is None:
             logger.error("Dataset %s did not contain expected data", key)
             return np.zeros((self.config.target_height, self.config.target_width), dtype=np.float32)
         return array
+
 
     def _normalize(self, tensor: np.ndarray, normalization: NormalizationArrays) -> np.ndarray:
         normalized = tensor.copy()
