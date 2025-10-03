@@ -1,17 +1,25 @@
 import os
+import sys
 import pickle
 import time
 import json
+from datetime import datetime
+from pathlib import Path
+
+# Ensure repository root is importable so evaluation loaders can resolve shared modules
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import boto3
 import redis
 import numpy as np
-from datetime import datetime
-from tensorflow import keras
-from rnn import *
-from models import *
 from dotenv import load_dotenv
+
+from evaluation.config import EvaluationConfig
+from evaluation.models import ModelLoader
+
 import logging
-import traceback
 
 # Setup logging
 logging.basicConfig(
@@ -86,18 +94,21 @@ s3 = boto3.client("s3")
 r = redis.Redis(host=redis_url, port=6379, db=0)
 assert r.ping(), "Cannot connect to Redis"
 
-# Load model once
-model = keras.models.load_model(
-    "model.keras",
-    custom_objects={'loss': weighted_mse(), 'reshape_and_stack': reshape_and_stack, 
-                   'csi': csi, 'slice_to_n_steps': slice_to_n_steps,
-                   'slice_output_shape': slice_output_shape, 'ResBlock': ResBlock,
-                   'WarmUpCosineDecayScheduler': WarmUpCosineDecayScheduler,
-                   'ConvGRU': ConvGRU, 'ConvBlock': ConvBlock,
-                   'ZeroLikeLayer': ZeroLikeLayer, 'ReflectionPadding2D': ReflectionPadding2D,
-                   'ResGRU': ResGRU, 'GRUResBlock': GRUResBlock}
-)
-logger.info("Model loaded successfully")
+# Resolve model path (allow overriding via environment variable)
+env_model_path = os.getenv("MODEL_PATH")
+if env_model_path:
+    model_path = Path(env_model_path)
+    if not model_path.is_absolute():
+        model_path = (ROOT_DIR / model_path).resolve()
+else:
+    model_path = (Path(__file__).parent / "model.keras").resolve()
+
+model_type = os.getenv("MODEL_TYPE", "convgru")
+config = EvaluationConfig(model_path=str(model_path), model_type=model_type)
+loader = ModelLoader()
+loaded_model = loader.load(config)
+model = loaded_model.model
+logger.info("Model loaded successfully as %s from %s", loaded_model.model_type.value, model_path)
 
 # Main loop
 while True:
