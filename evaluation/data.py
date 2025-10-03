@@ -151,7 +151,7 @@ class EvaluationDataRepository:
         cols = []
         for col in df.columns:
             lower = col.lower()
-            if "date" in lower or "time" in lower:
+            if "date" in lower or "time" in lower or "datetime" in lower:
                 cols.append(col)
         return cols
 
