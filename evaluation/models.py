@@ -5,6 +5,8 @@ import importlib
 import inspect
 import logging
 import os
+import shutil
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, Optional
@@ -14,6 +16,11 @@ from tensorflow import keras as tfk
 
 from . import config as cfg
 
+try:  # Optional dependency used only for legacy checkpoints
+    import h5py
+except Exception:  # pragma: no cover - environments without h5py
+    h5py = None
+
 
 class _LegacyConv2DTranspose(tfk.layers.Conv2DTranspose):
     """Conv2DTranspose variant that tolerates legacy HDF5 configs."""
@@ -21,6 +28,12 @@ class _LegacyConv2DTranspose(tfk.layers.Conv2DTranspose):
     def __init__(self, *args, **kwargs):
         kwargs.pop("groups", None)
         super().__init__(*args, **kwargs)
+
+    @classmethod
+    def from_config(cls, config):
+        config = dict(config)
+        config.pop("groups", None)
+        return super().from_config(config)
 
 
 _LambdaLayer = tfk.layers.Lambda
@@ -187,6 +200,30 @@ class ModelLoader:
         explicit_type = ModelType.from_string(config.model_type) if config.model_type else None
         model_type = explicit_type or _guess_model_type(model_path)
         custom_objects = _custom_objects_for(model_type)
-        model = tfk.models.load_model(model_path, custom_objects=custom_objects, compile=False)
+        model = self._load_with_fallbacks(model_path, custom_objects)
         logger.info("Loaded %s model from %s", model_type.value, model_path)
         return LoadedModel(model=model, model_type=model_type)
+
+    @staticmethod
+    def _load_with_fallbacks(path: str, custom_objects: Dict[str, object]) -> tfk.Model:
+        try:
+            return tfk.models.load_model(path, custom_objects=custom_objects, compile=False)
+        except ValueError as exc:
+            message = str(exc)
+            if (
+                "accessible `.keras` zip file" in message
+                and h5py is not None
+                and h5py.is_hdf5(path)
+            ):
+                logger.info("Detected legacy HDF5 checkpoint stored with .keras suffix; reloading via temporary .h5 copy")
+                with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+                    temp_path = tmp.name
+                try:
+                    shutil.copy2(path, temp_path)
+                    return tfk.models.load_model(temp_path, custom_objects=custom_objects, compile=False)
+                finally:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+            raise
