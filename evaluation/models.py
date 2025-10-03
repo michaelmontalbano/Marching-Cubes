@@ -23,6 +23,32 @@ class _LegacyConv2DTranspose(tfk.layers.Conv2DTranspose):
         super().__init__(*args, **kwargs)
 
 
+_LambdaLayer = tfk.layers.Lambda
+_original_lambda_compute_output_shape = _LambdaLayer.compute_output_shape
+
+
+def _safe_lambda_compute_output_shape(self, input_shape):
+    """Best-effort Lambda shape inference for legacy H5 checkpoints."""
+
+    try:
+        return _original_lambda_compute_output_shape(self, input_shape)
+    except NotImplementedError:
+        # Fallback heuristics mimic the common identity/reshape lambdas used in
+        # the historic ConvGRU exporter where the batch axis is unchanged.
+        if isinstance(input_shape, (list, tuple)):
+            if not input_shape:
+                return input_shape
+            # Single input stored in a tuple/list.
+            if len(input_shape) == 1:
+                return input_shape[0]
+            return input_shape[0]
+        return input_shape
+
+
+if getattr(_LambdaLayer.compute_output_shape, "__name__", "") != _safe_lambda_compute_output_shape.__name__:
+    _LambdaLayer.compute_output_shape = _safe_lambda_compute_output_shape
+
+
 def _fallback_weighted_mse():
     """Return a minimal weighted MSE implementation for ConvGRU checkpoints."""
 
